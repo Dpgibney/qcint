@@ -405,6 +405,168 @@ k_contracted: ;
 }
 
 
+// gctr[:n] (+)= sum of the first count lane blocks of gout (lane-major, n each)
+static void _sum_lanes(double *gctr, double *gout, size_t n, int count, int acc)
+{
+        size_t i;
+        int k = 0;
+        if (!acc) {
+                for (i = 0; i < n; i++) {
+                        gctr[i] = gout[i];
+                }
+                k = 1;
+        }
+        for (; k < count; k++) {
+                double *pg = gout + k * n;
+                for (i = 0; i < n; i++) {
+                        gctr[i] += pg[i];
+                }
+        }
+}
+
+/*
+ * CINT2e_loop for segmented contractions, one contracted function per shell
+ * (e.g. the def2 basis sets). Every primitive quartet then adds to the same
+ * output, so the coefficient of i is folded into the prefactor like those of
+ * j, k and l, and each batch of SIMDD primitive quartets is summed into the
+ * output, instead of the bookkeeping per primitive quartet and one
+ * CINTiprim_to_ctr call for each.
+ */
+static int _2e_loop_segmented(double *out, CINTEnvVars *envs, double *cache, int *empty,
+                              PairData *_pdata_ij, PairData *_pdata_kl)
+{
+        int *shls  = envs->shls;
+        int *bas = envs->bas;
+        double *env = envs->env;
+        int i_sh = shls[0];
+        int j_sh = shls[1];
+        int k_sh = shls[2];
+        int l_sh = shls[3];
+        CINTOpt *opt = envs->opt;
+        int i_prim = bas(NPRIM_OF, i_sh);
+        int j_prim = bas(NPRIM_OF, j_sh);
+        int k_prim = bas(NPRIM_OF, k_sh);
+        int l_prim = bas(NPRIM_OF, l_sh);
+        double *ai = env + bas(PTR_EXP, i_sh);
+        double *aj = env + bas(PTR_EXP, j_sh);
+        double *ak = env + bas(PTR_EXP, k_sh);
+        double *al = env + bas(PTR_EXP, l_sh);
+        double *ci = env + bas(PTR_COEFF, i_sh);
+        double *cj = env + bas(PTR_COEFF, j_sh);
+        double *ck = env + bas(PTR_COEFF, k_sh);
+        double *cl = env + bas(PTR_COEFF, l_sh);
+        double expcutoff = envs->expcutoff;
+        int n_comp = envs->ncomp_e1 * envs->ncomp_e2 * envs->ncomp_tensor;
+        size_t nf = envs->nf;
+        size_t ngp0 = nf * n_comp;
+        PairData *pdata_ij, *pdata_kl;
+        int ip, jp, kp, lp, i;
+
+        int *idx = opt->index_xyz_array[envs->i_l*LMAX1*LMAX1*LMAX1
+                                       +envs->j_l*LMAX1*LMAX1
+                                       +envs->k_l*LMAX1
+                                       +envs->l_l];
+        if (idx == NULL) {
+                MALLOC_DATA_INSTACK(idx, nf * 3);
+                CINTg4c_index_xyz(idx, envs);
+        }
+        // (irys,i,j,k,l,coord,0:1); +1 for nabla-r12
+        int leng = envs->g_size * 3 * ((1<<envs->gbits)+1) * SIMDD;
+        size_t len0 = ngp0 * SIMDD;
+        double *gout, *g, *gctr;
+        int acc;  // whether gctr holds a sum to add to
+        int added = 0;  // whether this call added to gctr
+        if (n_comp == 1) {
+                gctr = out;
+                acc = !*empty;
+        } else {
+                MALLOC_INSTACK(gctr, ngp0);
+                acc = 0;
+        }
+        MALLOC_INSTACK(gout, len0+MAX(len0,leng));
+        g = gout + len0;  // for gx, gy, gz
+
+        ALIGNMM Rys2eT bc;
+        ALIGNMM double cutoff[SIMDD];
+        double common_factor = envs->common_factor;
+        double fac1j, fac1k, fac1l, eijcutoff;
+        double *gx = g;
+        double *gy = g + envs->g_size * SIMDD;
+        __MD r1 = MM_SET1(1.);
+        for (i = 0; i < envs->nrys_roots; i++) {
+                MM_STORE(gx+i*SIMDD, r1);
+                MM_STORE(gy+i*SIMDD, r1);
+        }
+        MM_STORE(envs->ai, r1);
+        MM_STORE(envs->aj, r1);
+        MM_STORE(envs->ak, r1);
+        MM_STORE(envs->al, r1);
+        MM_STORE(envs->fac, MM_SET1(0.));
+        int cum = 0;
+
+        pdata_kl = _pdata_kl;
+        for (lp = 0; lp < l_prim; lp++) {
+                fac1l = common_factor * cl[lp];
+                for (kp = 0; kp < k_prim; kp++, pdata_kl++) {
+                        if (pdata_kl->cceij > expcutoff) {
+                                continue;
+                        }
+                        fac1k = fac1l * ck[kp];
+                        eijcutoff = expcutoff - MAX(pdata_kl->cceij, 0);
+                        pdata_ij = _pdata_ij;
+                        for (jp = 0; jp < j_prim; jp++) {
+                                fac1j = fac1k * cj[jp];
+                                for (ip = 0; ip < i_prim; ip++, pdata_ij++) {
+                                        if (pdata_ij->cceij > eijcutoff) {
+                                                continue;
+                                        }
+                                        if (cum == SIMDD) {
+                                                if ((*envs->f_g0_2e)(g, cutoff, &bc, envs, cum)) {
+                                                        (*envs->f_gout)(gout, g, idx, envs);
+                                                        _sum_lanes(gctr, gout, ngp0, cum, acc);
+                                                        acc = added = 1;
+                                                }
+                                                cum = 0;
+                                        }
+                                        envs->ai[cum] = ai[ip];
+                                        envs->aj[cum] = aj[jp];
+                                        envs->ak[cum] = ak[kp];
+                                        envs->al[cum] = al[lp];
+                                        envs->rij[0*SIMDD+cum] = pdata_ij->rij[0];
+                                        envs->rij[1*SIMDD+cum] = pdata_ij->rij[1];
+                                        envs->rij[2*SIMDD+cum] = pdata_ij->rij[2];
+                                        envs->rkl[0*SIMDD+cum] = pdata_kl->rij[0];
+                                        envs->rkl[1*SIMDD+cum] = pdata_kl->rij[1];
+                                        envs->rkl[2*SIMDD+cum] = pdata_kl->rij[2];
+                                        envs->fac[cum] = fac1j * (pdata_ij->eij * pdata_kl->eij) * ci[ip];
+                                        cutoff[cum] = eijcutoff - pdata_ij->cceij;
+                                        cum++;
+                                }
+                        }
+                }
+        }
+        if (cum == 1) {
+                if ((*envs->f_g0_2e_simd1)(g, cutoff, &bc, envs, 0)) {
+                        (*envs->f_gout_simd1)(gout, g, idx, envs);
+                        _sum_lanes(gctr, gout, ngp0, 1, acc);
+                        acc = added = 1;
+                }
+        } else if (cum > 1) {
+                if ((*envs->f_g0_2e)(g, cutoff, &bc, envs, cum)) {
+                        (*envs->f_gout)(gout, g, idx, envs);
+                        _sum_lanes(gctr, gout, ngp0, cum, acc);
+                        acc = added = 1;
+                }
+        }
+
+        if (n_comp > 1 && added) {
+                int nc = 1;
+                TRANSPOSE(gctr);
+        }
+        *empty &= !added;
+        return added;
+}
+
 int CINT2e_loop(double *out, CINTEnvVars *envs, double *cache, int *empty)
 {
         int *shls  = envs->shls;
@@ -461,6 +623,10 @@ int CINT2e_loop(double *out, CINTEnvVars *envs, double *cache, int *empty)
                                      k_prim, l_prim, SQUARE(envs->rkrl), expcutoff, env)) {
                         return 0;
                 }
+        }
+
+        if (i_ctr == 1 && j_ctr == 1 && k_ctr == 1 && l_ctr == 1) {
+                return _2e_loop_segmented(out, envs, cache, empty, _pdata_ij, _pdata_kl);
         }
 
         int n_comp = envs->ncomp_e1 * envs->ncomp_e2 * envs->ncomp_tensor;

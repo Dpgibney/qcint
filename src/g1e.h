@@ -85,7 +85,28 @@ double CINTcommon_fac_sp(int l);
         __m256i vindex = _mm256_set_epi32( \
                 nfc*7, nfc*6, nfc*5, nfc*4, nfc*3, nfc*2, nfc*1,    0);
 
-#define GOUT_SCATTER(gout, n, r0) _mm512_i32scatter_pd(gout+n, vindex, r0, 8)
+// A store and eight scalar stores instead of _mm512_i32scatter_pd, which is
+// microcoded and slow on AMD Zen 4/5. The offsets in vindex are invariant in
+// the loops that call it and are hoisted out once inlined.
+#ifndef HAVE_DEFINED_GOUT_SCATTER8
+#define HAVE_DEFINED_GOUT_SCATTER8
+static inline void _gout_scatter8(double *gout, __m256i vindex, __m512d r0)
+{
+        ALIGNMM double gc[8];
+        int idx[8];
+        _mm512_store_pd(gc, r0);
+        _mm256_storeu_si256((__m256i *)idx, vindex);
+        gout[idx[0]] = gc[0];
+        gout[idx[1]] = gc[1];
+        gout[idx[2]] = gc[2];
+        gout[idx[3]] = gc[3];
+        gout[idx[4]] = gc[4];
+        gout[idx[5]] = gc[5];
+        gout[idx[6]] = gc[6];
+        gout[idx[7]] = gc[7];
+}
+#endif
+#define GOUT_SCATTER(gout, n, r0) _gout_scatter8((gout)+(n), vindex, r0)
 
 #elif (SIMDD == 4)
 
