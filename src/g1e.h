@@ -105,8 +105,26 @@ static inline void _gout_scatter8(double *gout, __m256i vindex, __m512d r0)
         gout[idx[6]] = gc[6];
         gout[idx[7]] = gc[7];
 }
+// Number of lanes for which GOUT_SCATTER adds each result vector into the
+// accumulator gout[n*SIMDD] instead of scattering it, 0 to scatter. Set by the
+// segmented loop of CINT2e_loop (cint2e.c) around calls of gout functions
+// that write their results only through GOUT_SCATTER.
+extern __thread int _CINTgout_acc_lanes __attribute__((visibility("hidden")));
+static inline void _gout_acc8(double *gacc, __m512d r0, int lanes)
+{
+        __mmask8 mask = lanes >= 8 ? 0xff : (1 << lanes) - 1;
+        __m512d acc = _mm512_load_pd(gacc);
+        _mm512_store_pd(gacc, _mm512_mask_add_pd(acc, mask, acc, r0));
+}
 #endif
-#define GOUT_SCATTER(gout, n, r0) _gout_scatter8((gout)+(n), vindex, r0)
+#define GOUT_SCATTER(gout, n, r0) \
+        do { \
+                if (_CINTgout_acc_lanes) { \
+                        _gout_acc8((gout)+(n)*SIMDD, r0, _CINTgout_acc_lanes); \
+                } else { \
+                        _gout_scatter8((gout)+(n), vindex, r0); \
+                } \
+        } while (0)
 
 #elif (SIMDD == 4)
 

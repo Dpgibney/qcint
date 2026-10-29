@@ -19,6 +19,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
@@ -424,6 +425,67 @@ static void _sum_lanes(double *gctr, double *gout, size_t n, int count, int acc)
         }
 }
 
+#if (SIMDD == 8)
+__thread int _CINTgout_acc_lanes = 0;
+
+void CINTgout2e_int2e_ip1();
+void CINTgout2e_int2e_ip2();
+void CINTgout2e_int2e_ipip1();
+void CINTgout2e_int2e_ipvip1();
+void CINTgout2e_int2e_ip1ip2();
+
+// Generated gout functions that write their results only through
+// GOUT_SCATTER, each output once, so that _CINTgout_acc_lanes turns them into
+// accumulators: the derivative integrals of gradients and hessians.
+static int _gout_acc_by_scatter(void (*fgout)())
+{
+        return fgout == &CINTgout2e_int2e_ip1 ||
+               fgout == &CINTgout2e_int2e_ip2 ||
+               fgout == &CINTgout2e_int2e_ipip1 ||
+               fgout == &CINTgout2e_int2e_ipvip1 ||
+               fgout == &CINTgout2e_int2e_ip1ip2;
+}
+
+/*
+ * CINTgout2e for the first count lanes of a batch, added to
+ * gacc[n*SIMDD+lane] instead of being transposed to the lane blocks of gout.
+ * Lanes from count on are masked out.
+ */
+static void _gout2e_acc(double *gacc, double *g, int *idx, CINTEnvVars *envs, int count)
+{
+        int nf = envs->nf;
+        int nroots = envs->nrys_roots;
+        __mmask8 mask = count >= SIMDD ? 0xff : (1 << count) - 1;
+        double *gx, *gy, *gz;
+        __m512d r0, acc;
+        int n, i;
+        for (n = 0; n < nf; n++) {
+                gx = g + idx[0+n*3] * SIMDD;
+                gy = g + idx[1+n*3] * SIMDD;
+                gz = g + idx[2+n*3] * SIMDD;
+                r0 = MM_MUL(MM_MUL(MM_LOAD(gx), MM_LOAD(gy)), MM_LOAD(gz));
+                for (i = 1; i < nroots; i++) {
+                        r0 = MM_FMA(MM_MUL(MM_LOAD(gx+i*SIMDD), MM_LOAD(gy+i*SIMDD)),
+                                    MM_LOAD(gz+i*SIMDD), r0);
+                }
+                acc = MM_LOAD(gacc+n*SIMDD);
+                MM_STORE(gacc+n*SIMDD, _mm512_mask_add_pd(acc, mask, acc, r0));
+        }
+}
+
+static void _gout_accumulate(double *gacc, double *g, int *idx, CINTEnvVars *envs,
+                             int count, int mode)
+{
+        if (mode == 1) {
+                _gout2e_acc(gacc, g, idx, envs, count);
+        } else {
+                _CINTgout_acc_lanes = count;
+                (*envs->f_gout)(gacc, g, idx, envs);
+                _CINTgout_acc_lanes = 0;
+        }
+}
+#endif
+
 /*
  * CINT2e_loop for segmented contractions, one contracted function per shell
  * (e.g. the def2 basis sets). Every primitive quartet then adds to the same
@@ -485,6 +547,19 @@ static int _2e_loop_segmented(double *out, CINTEnvVars *envs, double *cache, int
         }
         MALLOC_INSTACK(gout, len0+MAX(len0,leng));
         g = gout + len0;  // for gx, gy, gz
+        double *gout1;  // the single primitive quartet of the scalar path
+        MALLOC_INSTACK(gout1, ngp0);
+#if (SIMDD == 8)
+        // The batches are summed in SIMD registers, lane by lane (gacc), and the
+        // lanes at the end: int2e by _gout2e_acc, the derivative integrals by
+        // their gout functions in the accumulating mode of GOUT_SCATTER
+        int use_acc = envs->f_gout == &CINTgout2e ? 1 :
+                      _gout_acc_by_scatter(envs->f_gout) ? 2 : 0;
+#else
+        int use_acc = 0;
+#endif
+        double *gacc = gout;
+        int nacc = 0;
 
         ALIGNMM Rys2eT bc;
         ALIGNMM double cutoff[SIMDD];
@@ -521,7 +596,15 @@ static int _2e_loop_segmented(double *out, CINTEnvVars *envs, double *cache, int
                                                 continue;
                                         }
                                         if (cum == SIMDD) {
-                                                if ((*envs->f_g0_2e)(g, cutoff, &bc, envs, cum)) {
+                                                if (!(*envs->f_g0_2e)(g, cutoff, &bc, envs, cum)) {
+                                                } else if (use_acc) {
+#if (SIMDD == 8)
+                                                        if (nacc++ == 0) {
+                                                                memset(gacc, 0, sizeof(double)*len0);
+                                                        }
+                                                        _gout_accumulate(gacc, g, idx, envs, cum, use_acc);
+#endif
+                                                } else {
                                                         (*envs->f_gout)(gout, g, idx, envs);
                                                         _sum_lanes(gctr, gout, ngp0, cum, acc);
                                                         acc = added = 1;
@@ -545,18 +628,40 @@ static int _2e_loop_segmented(double *out, CINTEnvVars *envs, double *cache, int
                         }
                 }
         }
+        int have1 = 0;
         if (cum == 1) {
                 if ((*envs->f_g0_2e_simd1)(g, cutoff, &bc, envs, 0)) {
-                        (*envs->f_gout_simd1)(gout, g, idx, envs);
-                        _sum_lanes(gctr, gout, ngp0, 1, acc);
-                        acc = added = 1;
+                        (*envs->f_gout_simd1)(gout1, g, idx, envs);
+                        have1 = 1;
                 }
         } else if (cum > 1) {
-                if ((*envs->f_g0_2e)(g, cutoff, &bc, envs, cum)) {
+                if (!(*envs->f_g0_2e)(g, cutoff, &bc, envs, cum)) {
+                } else if (use_acc) {
+#if (SIMDD == 8)
+                        if (nacc++ == 0) {
+                                memset(gacc, 0, sizeof(double)*len0);
+                        }
+                        _gout_accumulate(gacc, g, idx, envs, cum, use_acc);
+#endif
+                } else {
                         (*envs->f_gout)(gout, g, idx, envs);
                         _sum_lanes(gctr, gout, ngp0, cum, acc);
                         acc = added = 1;
                 }
+        }
+#if (SIMDD == 8)
+        if (nacc > 0) {
+                size_t n;
+                for (n = 0; n < ngp0; n++) {
+                        double s = _mm512_reduce_add_pd(MM_LOAD(gacc+n*SIMDD));
+                        gctr[n] = acc ? gctr[n] + s : s;
+                }
+                acc = added = 1;
+        }
+#endif
+        if (have1) {
+                _sum_lanes(gctr, gout1, ngp0, 1, acc);
+                acc = added = 1;
         }
 
         if (n_comp > 1 && added) {
