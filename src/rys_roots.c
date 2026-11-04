@@ -31,6 +31,7 @@
 #include "simd.h"
 #include "misc.h"
 #include "rys_roots.h"
+#include "rys_roots_chunk.h"
 #include "roots_for_x0.dat"
 #include "rys_xw.dat"
 
@@ -74,6 +75,11 @@ static int segment_solve(int n, double x, double lower, double *u, double *w,
 
 void _CINTrys_roots_batch(int nroots, double *x, double *u, double *w, int count)
 {
+#if defined(__AVX512F__) || defined(__AVX__)
+        if (count == SIMDD && CINTrys_roots_chunk(nroots, x, u, w)) {
+                return;
+        }
+#endif
         double roots[MXRYSROOTS * 2];
         double *weights = roots + nroots;
         int i, k;
@@ -91,6 +97,17 @@ void _CINTrys_roots_batch(int nroots, double *x, double *u, double *w, int count
                         w[k*SIMDD+i] = weights[k];
                 }
         }
+}
+
+/*
+ * The constants of CINTrys_roots' large-x branch: for x >= 35 + 5 * nroots it returns
+ * u[i] = rt[i] / (x - rt[i]) and w[i] = ww[i] * sqrt(PIE4 / x).
+ */
+void CINTrys_largex_tables(int nroots, const double **rt, const double **ww)
+{
+        int off = nroots * (nroots - 1) / 2;
+        *rt = POLY_LARGEX_RT + off;
+        *ww = POLY_LARGEX_WW + off;
 }
 
 int CINTrys_roots(int nroots, double x, double *u, double *w)
@@ -693,6 +710,200 @@ static int rys_root2(double X, double *roots, double *weights)
         }
         return 0;
 }
+
+#if defined(__AVX512F__) || defined(__AVX__)
+// POLYSUM4's polynomial i of POLY at the lanes of X
+static inline __MD _chunk_poly(const double *POLY, int i, __MD X, int count)
+{
+        __MD r = MM_SET1(POLY[i]);
+        int n;
+        for (n = 1; n < count; n++) {
+                r = MM_FMA(r, X, MM_SET1(POLY[n*4+i]));
+        }
+        return r;
+}
+
+/*
+ * CINTrys_roots(2, x) at the SIMDD points of a chunk: the large-x form at x >= 45, rys_root2 below, whose fit of
+ * each interval of x is evaluated on the whole chunk when a point of the chunk is in it and selected by x.
+ */
+static int _rys_root2_chunk(double *x, double *u, double *w)
+{
+        const double R12  = 2.75255128608411E-01;
+        const double R22  = 2.72474487139158E+00;
+        const double W22  = 9.17517095361369E-02;
+        __MD X = MM_LOADU(x);
+        if (CHUNK_CMP(X, 3.e-7) != CHUNK_LANES) {
+                return 0;
+        }
+        int gt1 = CHUNK_CMP(X, 1.);
+        int gt3 = CHUNK_CMP(X, 3.);
+        int gt5 = CHUNK_CMP(X, 5.);
+        int gt10 = CHUNK_CMP(X, 10.);
+        int gt15 = CHUNK_CMP(X, 15.);
+        int gt33 = CHUNK_CMP(X, 33.);
+        int gt40 = CHUNK_CMP(X, 40.);
+        int ge45 = CHUNK_CMPGE(X, 45.);
+        ALIGNMM double es[SIMDD];
+        int l;
+        for (l = 0; l < SIMDD; l++) {
+                es[l] = exp(-x[l]);
+        }
+        const __MD E = MM_LOAD(es);
+        const __MD rpie4 = MM_SET1(PIE4);
+        __MD r0, r1, w0, w1, F1, Y, X1, s0, s1, s2, t0, t1, t2;
+        r0 = r1 = w0 = F1 = MM_SET1(0.);
+        // the intervals below 33 end with the same weights from F1, r0, r1, w0
+        if (~gt1 & CHUNK_LANES) {
+                r0 = _chunk_poly(POLY2_1, 0, X, 10);
+                r1 = _chunk_poly(POLY2_1, 1, X, 10);
+                F1 = _chunk_poly(POLY2_1, 2, X, 10);
+                w0 = (X+X)*F1+E;
+        }
+        if (gt1 & ~gt3) {
+                Y = X-2.0E+00;
+                s0 = _chunk_poly(POLY2_3, 0, Y, 12);
+                s1 = _chunk_poly(POLY2_3, 1, Y, 12);
+                s2 = _chunk_poly(POLY2_3, 2, Y, 12);
+                r0 = CHUNK_SELECT(X, 1., s0, r0);
+                r1 = CHUNK_SELECT(X, 1., s1, r1);
+                F1 = CHUNK_SELECT(X, 1., s2, F1);
+                w0 = CHUNK_SELECT(X, 1., (X+X)*s2+E, w0);
+        }
+        if (gt3 & ~gt5) {
+                Y = X-4.0E+00;
+                s0 = _chunk_poly(POLY2_5, 0, Y, 12);
+                s1 = _chunk_poly(POLY2_5, 1, Y, 12);
+                s2 = _chunk_poly(POLY2_5, 2, Y, 12);
+                r0 = CHUNK_SELECT(X, 3., s0, r0);
+                r1 = CHUNK_SELECT(X, 3., s1, r1);
+                F1 = CHUNK_SELECT(X, 3., s2, F1);
+                w0 = CHUNK_SELECT(X, 3., (X+X)*s2+E, w0);
+        }
+        if (gt5 & ~gt10) {
+                X1 = 1/X;
+                t0 = (((((( 4.6897511375022E-01*X1-6.9955602298985E-01)*X1 +
+                           5.3689283271887E-01)*X1-3.2883030418398E-01)*X1 +
+                         2.4645596956002E-01)*X1-4.9984072848436E-01)*X1 -
+                       3.1501078774085E-06)*E + MM_SQRT(rpie4*X1);
+                Y = X-7.5E+00;
+                s0 = _chunk_poly(POLY2_10, 0, Y, 15);
+                s1 = _chunk_poly(POLY2_10, 1, Y, 15);
+                r0 = CHUNK_SELECT(X, 5., s0, r0);
+                r1 = CHUNK_SELECT(X, 5., s1, r1);
+                F1 = CHUNK_SELECT(X, 5., (t0-E)*X1*.5, F1);
+                w0 = CHUNK_SELECT(X, 5., t0, w0);
+        }
+        if (gt10 & ~gt15) {
+                X1 = 1/X;
+                s0 = _chunk_poly(POLY2_15, 0, X, 4);
+                s1 = _chunk_poly(POLY2_15, 1, X, 4);
+                t0 = _chunk_poly(POLY2_15A, 0, X1, 5);
+                t1 = _chunk_poly(POLY2_15A, 1, X1, 5);
+                t2 = _chunk_poly(POLY2_15A, 2, X1, 5);
+                s0 = (s0*X + t0) * E + R12/(X-R12);
+                s1 = (s1*X + t1) * E + R22/(X-R22);
+                t2 = t2*E + MM_SQRT(rpie4*X1);
+                r0 = CHUNK_SELECT(X, 10., s0, r0);
+                r1 = CHUNK_SELECT(X, 10., s1, r1);
+                F1 = CHUNK_SELECT(X, 10., (t2-E)*X1*.5, F1);
+                w0 = CHUNK_SELECT(X, 10., t2, w0);
+        }
+        if (gt15 & ~gt33) {
+                s0 = _chunk_poly(POLY2_33, 0, X, 4);
+                s1 = _chunk_poly(POLY2_33, 1, X, 4);
+                X1 = 1/X;
+                t0 = _chunk_poly(POLY2_33A, 0, X1, 3);
+                t1 = _chunk_poly(POLY2_33A, 1, X1, 3);
+                t2 = _chunk_poly(POLY2_33A, 2, X1, 3);
+                s0 = (s0*X + t0) * E + R12/(X-R12);
+                s1 = (s1*X + t1) * E + R22/(X-R22);
+                t2 = t2*E + MM_SQRT(rpie4*X1);
+                r0 = CHUNK_SELECT(X, 15., s0, r0);
+                r1 = CHUNK_SELECT(X, 15., s1, r1);
+                F1 = CHUNK_SELECT(X, 15., (t2-E)*X1*.5, F1);
+                w0 = CHUNK_SELECT(X, 15., t2, w0);
+        }
+        w1 = ((F1-w0)*r0+F1) * (1.+r1)/(r1-r0);
+        w0 -= w1;
+        if (gt33) {
+                // (33, 40], (40, 45) and the large-x form of CINTrys_roots at x >= 45
+                __MD t = MM_SQRT(rpie4/X);
+                s0 = R12/(X-R12);
+                s1 = R22/(X-R22);
+                t1 = W22*t;
+                if (gt33 & ~gt40) {
+                        __MD a0 = (POLY2_40[0]*X + POLY2_40[4])*E + s0;
+                        __MD a1 = (POLY2_40[1]*X + POLY2_40[5])*E + s1;
+                        __MD b1 = (POLY2_40[2]*X + POLY2_40[6])*E + t1;
+                        r0 = CHUNK_SELECT(X, 33., a0, r0);
+                        r1 = CHUNK_SELECT(X, 33., a1, r1);
+                        w1 = CHUNK_SELECT(X, 33., b1, w1);
+                        w0 = CHUNK_SELECT(X, 33., t - b1, w0);
+                }
+                if (gt40) {
+                        r0 = CHUNK_SELECT(X, 40., s0, r0);
+                        r1 = CHUNK_SELECT(X, 40., s1, r1);
+                        w1 = CHUNK_SELECT(X, 40., t1, w1);
+                        w0 = CHUNK_SELECT(X, 40., t - t1, w0);
+                }
+                if (ge45) {
+                        int off = 1;  // nroots * (nroots - 1) / 2
+                        __MD q0 = MM_SET1(POLY_LARGEX_RT[off]);
+                        __MD q1 = MM_SET1(POLY_LARGEX_RT[off+1]);
+                        r0 = CHUNK_SELECT_GE(X, 45., q0/(X-q0), r0);
+                        r1 = CHUNK_SELECT_GE(X, 45., q1/(X-q1), r1);
+                        w0 = CHUNK_SELECT_GE(X, 45., POLY_LARGEX_WW[off] * t, w0);
+                        w1 = CHUNK_SELECT_GE(X, 45., POLY_LARGEX_WW[off+1] * t, w1);
+                }
+        }
+        MM_STOREU(u, r0);
+        MM_STOREU(u+SIMDD, r1);
+        MM_STOREU(w, w0);
+        MM_STOREU(w+SIMDD, w1);
+        return 1;
+}
+
+// CINTrys_roots(1, x) at the SIMDD points of a chunk
+static int _rys_root1_chunk(double *x, double *u, double *w)
+{
+        __MD ru, rw;
+        if (!CINTrys_root1_chunk(MM_LOADU(x), &ru, &rw, 0)) {
+                return 0;
+        }
+        MM_STOREU(u, ru);
+        MM_STOREU(w, rw);
+        return 1;
+}
+
+/*
+ * CINTrys_roots(nroots, x[k], ...) for the SIMDD points of a chunk at once, u[i*SIMDD+k] and w[i*SIMDD+k] for
+ * root i and point k: any number of roots when all points are in the large-x range, one or two roots at
+ * x > 3e-7 (the fit of each interval of x is evaluated on the whole chunk when a point of the chunk is in it,
+ * and selected by x; exp(-x) of the lanes in one loop, which the compiler vectorizes where the C library has
+ * vector exp). Returns 0, with nothing done, for the other chunks.
+ */
+int CINTrys_roots_chunk(int nroots, double *x, double *u, double *w)
+{
+        __MD X = MM_LOADU(x);
+        if (CHUNK_CMPGE(X, 35. + nroots * 5) == CHUNK_LANES) {
+                int off = nroots * (nroots - 1) / 2;
+                __MD t = MM_SQRT(MM_SET1(PIE4) / X);
+                int i;
+                for (i = 0; i < nroots; i++) {
+                        __MD rt = MM_SET1(POLY_LARGEX_RT[off+i]);
+                        MM_STOREU(u+i*SIMDD, rt / (X - rt));
+                        MM_STOREU(w+i*SIMDD, MM_SET1(POLY_LARGEX_WW[off+i]) * t);
+                }
+                return 1;
+        } else if (nroots == 1) {
+                return _rys_root1_chunk(x, u, w);
+        } else if (nroots == 2) {
+                return _rys_root2_chunk(x, u, w);
+        }
+        return 0;
+}
+#endif
 
 ALIGNMM const static double POLY3_1[] = {
 +0                    , +0                    , +0                    , -7.60911486098850E-08 ,

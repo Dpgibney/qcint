@@ -22,6 +22,8 @@
 #include "g1e.h"
 
 int CINTrys_roots(int nroots, double x, double *u, double *w);
+void CINTrys_largex_tables(int nroots, const double **rt, const double **ww);
+int CINTrys_roots_chunk(int nroots, double *x, double *u, double *w);
 void _CINTrys_roots_batch(int nroots, double *x, double *u, double *w, int count);
 int CINTsr_rys_roots(int nroots, double x, double lower, double *u, double *w);
 int _CINTsr_rys_roots_batch(CINTEnvVars *envs, double *x, double *theta,
