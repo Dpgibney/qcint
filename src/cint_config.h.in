@@ -32,4 +32,4 @@
 
 #define OF_CMPLX        2
 
-#define GRID_BLKSIZE    104
+#define GRID_BLKSIZE    112
