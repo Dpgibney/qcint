@@ -11,6 +11,7 @@
 #include "g1e.h"
 #include "g1e_grids.h"
 #include "rys_roots.h"
+#include "rys_roots_chunk.h"
 #include "simd.h"
 
 
@@ -108,13 +109,67 @@ int CINTg0_1e_grids(double *RESTRICT g, double cutoff, CINTEnvVars *envs,
         assert(zeta >= 0);
         if (omega == 0. && zeta == 0.) {
                 fac1 = envs->fac[0] / aij;
-                for (ig = 0; ig < bgrids; ig++) {
-                        x = aij * RGSQUARE(rijrg, ig);
-                        CINTrys_roots(nroots, x, ubuf, wbuf);
-                        for (i = 0; i < nroots; i++) {
-                                // transform to t^2
-                                u[ig+GRID_BLKSIZE*i] = ubuf[i] / (ubuf[i] + 1);
-                                w[ig+GRID_BLKSIZE*i] = wbuf[i] * fac1;
+#ifdef HAVE_RYS_ROOTS_CHUNK
+                // Most points are far from the pair (x >= 35+5*nroots), where CINTrys_roots returns
+                // u = rt/(x-rt) and w = ww*sqrt(PIE4/x). A chunk of SIMDD points that are all there is done
+                // here at once, any chunk of one root by CINTrys_root1_chunk (inlined, t^2 formed directly)
+                // and of two by CINTrys_roots_chunk; the others point by point.
+                const double *rt_large, *ww_large;
+                CINTrys_largex_tables(nroots, &rt_large, &ww_large);
+                const __MD rlarge = MM_SET1(35. + nroots * 5);
+                const __MD rpie4 = MM_SET1(CHUNK_PIE4);
+                const __MD raij = MM_SET1(aij);
+                const __MD rfac1 = MM_SET1(fac1);
+#endif
+                for (ig = 0; ig < bgrids; ig += SIMDD) {
+#ifdef HAVE_RYS_ROOTS_CHUNK
+                        if (ig + SIMDD <= bgrids) {
+                                __MD dx = MM_LOAD(rijrg+ig+GRID_BLKSIZE*0);
+                                __MD dy = MM_LOAD(rijrg+ig+GRID_BLKSIZE*1);
+                                __MD dz = MM_LOAD(rijrg+ig+GRID_BLKSIZE*2);
+                                __MD rx = raij * (dx * dx + dy * dy + dz * dz);
+                                __MD rt2_1, rw_1;
+                                if (nroots == 1 && CINTrys_root1_chunk(rx, &rt2_1, &rw_1, 1)) {
+                                        MM_STORE(u+ig, rt2_1);
+                                        MM_STORE(w+ig, rw_1 * rfac1);
+                                        continue;
+                                }
+                                if (MM_CMP(rx, rlarge, _CMP_GE_OQ) == CHUNK_LANES) {
+                                        __MD rt = MM_SQRT(rpie4 / rx);
+                                        __MD rt2 = rt * rt;
+                                        for (i = 0; i < nroots; i++) {
+                                                // t^2 = u/(u+1) of u = rt_large/(x-rt_large) is rt_large/x
+                                                MM_STORE(u+ig+GRID_BLKSIZE*i, MM_SET1(rt_large[i] / CHUNK_PIE4) * rt2);
+                                                MM_STORE(w+ig+GRID_BLKSIZE*i, MM_SET1(ww_large[i]) * rt * rfac1);
+                                        }
+                                        continue;
+                                }
+                                if (nroots == 2) {
+                                        ALIGNMM double xs[SIMDD];
+                                        ALIGNMM double us[SIMDD*2];
+                                        ALIGNMM double ws[SIMDD*2];
+                                        MM_STORE(xs, rx);
+                                        if (CINTrys_roots_chunk(2, xs, us, ws)) {
+                                                for (i = 0; i < 2; i++) {
+                                                        __MD ru = MM_LOAD(us+SIMDD*i);
+                                                        // transform to t^2
+                                                        MM_STORE(u+ig+GRID_BLKSIZE*i, ru / (ru + MM_SET1(1.)));
+                                                        MM_STORE(w+ig+GRID_BLKSIZE*i, MM_LOAD(ws+SIMDD*i) * rfac1);
+                                                }
+                                                continue;
+                                        }
+                                }
+                        }
+#endif
+                        int ig1 = MIN(ig + SIMDD, bgrids);
+                        for (int jg = ig; jg < ig1; jg++) {
+                                x = aij * RGSQUARE(rijrg, jg);
+                                CINTrys_roots(nroots, x, ubuf, wbuf);
+                                for (i = 0; i < nroots; i++) {
+                                        // transform to t^2
+                                        u[jg+GRID_BLKSIZE*i] = ubuf[i] / (ubuf[i] + 1);
+                                        w[jg+GRID_BLKSIZE*i] = wbuf[i] * fac1;
+                                }
                         }
                 }
         } else if (omega < 0.) { // short-range part of range-separated Coulomb
