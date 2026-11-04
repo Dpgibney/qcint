@@ -20,6 +20,7 @@ void CINTinit_int1e_grids_EnvVars(CINTEnvVars *envs, int *ng, int *shls,
                                   int *bas, int nbas, double *env)
 {
         CINTinit_int1e_EnvVars(envs, ng, shls, atm, natm, bas, nbas, env);
+        envs->opt = NULL;
         int ngrids = shls[3] - shls[2];
         double *grids = env + (size_t)env[PTR_GRIDS] + shls[2] * 3;
 
