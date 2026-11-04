@@ -121,20 +121,24 @@ int CINT1e_grids_loop(double *gctr, CINTEnvVars *envs, double *cache)
                 gout = g1;
         }
 
-#if (SIMDD == 8)
-        __m256i vindex = _mm256_set_epi32(21, 18, 15, 12, 9, 6, 3, 0);
-#elif __AVX2__
-        __m128i vindex = _mm_set_epi32(9, 6, 3, 0);
-#endif
         for (grids_offset = 0; grids_offset < ngrids; grids_offset += GRID_BLKSIZE) {
                 envs->grids_offset = grids_offset;
                 bgrids = MIN(ngrids - grids_offset, GRID_BLKSIZE);
                 bgrids = ALIGN_UP(bgrids, SIMDD);
 #if (SIMDD == 8) || __AVX2__
-                for (i = 0; i < bgrids; i += SIMDD) {
-                        MM_STORE(gridsT+i+GRID_BLKSIZE*0, MM_GATHER(grids+(grids_offset+i)*3+0, vindex, 8));
-                        MM_STORE(gridsT+i+GRID_BLKSIZE*1, MM_GATHER(grids+(grids_offset+i)*3+1, vindex, 8));
-                        MM_STORE(gridsT+i+GRID_BLKSIZE*2, MM_GATHER(grids+(grids_offset+i)*3+2, vindex, 8));
+                // x, y, z of four points at a time from three loads, by lane permutations and shuffles
+                // (cheaper than gathers, which are microcoded on some CPUs)
+                for (i = 0; i < bgrids; i += 4) {
+                        const double *pg = grids + (grids_offset+i) * 3;
+                        __m256d a = _mm256_loadu_pd(pg);      // x0 y0 z0 x1
+                        __m256d b = _mm256_loadu_pd(pg + 4);  // y1 z1 x2 y2
+                        __m256d c = _mm256_loadu_pd(pg + 8);  // z2 x3 y3 z3
+                        __m256d u = _mm256_permute2f128_pd(a, b, 0x30);  // x0 y0 x2 y2
+                        __m256d v = _mm256_permute2f128_pd(a, c, 0x21);  // z0 x1 z2 x3
+                        __m256d w = _mm256_permute2f128_pd(b, c, 0x30);  // y1 z1 y3 z3
+                        _mm256_store_pd(gridsT+i+GRID_BLKSIZE*0, _mm256_shuffle_pd(u, v, 0xa));
+                        _mm256_store_pd(gridsT+i+GRID_BLKSIZE*1, _mm256_shuffle_pd(u, w, 0x5));
+                        _mm256_store_pd(gridsT+i+GRID_BLKSIZE*2, _mm256_shuffle_pd(v, w, 0xa));
                 }
 #else
                 for (i = 0; i < bgrids; i++) {
