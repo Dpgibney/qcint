@@ -241,13 +241,63 @@ int CINTg0_1e_grids(double *RESTRICT g, double cutoff, CINTEnvVars *envs,
                         a0 *= theta;
                         fac1 *= sqrt(theta);
                 }
-                for (ig = 0; ig < bgrids; ig++) {
-                        x = a0 * RGSQUARE(rijrg, ig);
-                        CINTrys_roots(nroots, x, ubuf, wbuf);
-                        for (i = 0; i < nroots; i++) {
-                                // u stores t^2 = tau^2 * theta
-                                u[ig+GRID_BLKSIZE*i] = ubuf[i] / (ubuf[i] + 1) * theta;
-                                w[ig+GRID_BLKSIZE*i] = wbuf[i] * fac1;
+#ifdef HAVE_RYS_ROOTS_CHUNK
+                // The chunks of the bare Coulomb branch above, with x = a0*|r_ij-r_g|^2 and t^2 times theta
+                const double *rt_large, *ww_large;
+                CINTrys_largex_tables(nroots, &rt_large, &ww_large);
+                const __MD rlarge = MM_SET1(35. + nroots * 5);
+                const __MD rpie4 = MM_SET1(CHUNK_PIE4);
+                const __MD ra0 = MM_SET1(a0);
+                const __MD rfac1 = MM_SET1(fac1);
+                const __MD rtheta = MM_SET1(theta);
+#endif
+                for (ig = 0; ig < bgrids; ig += SIMDD) {
+#ifdef HAVE_RYS_ROOTS_CHUNK
+                        if (ig + SIMDD <= bgrids) {
+                                __MD dx = MM_LOAD(rijrg+ig+GRID_BLKSIZE*0);
+                                __MD dy = MM_LOAD(rijrg+ig+GRID_BLKSIZE*1);
+                                __MD dz = MM_LOAD(rijrg+ig+GRID_BLKSIZE*2);
+                                __MD rx = ra0 * (dx * dx + dy * dy + dz * dz);
+                                __MD rt2_1, rw_1;
+                                if (nroots == 1 && CINTrys_root1_chunk(rx, &rt2_1, &rw_1, 1)) {
+                                        MM_STORE(u+ig, rt2_1 * rtheta);
+                                        MM_STORE(w+ig, rw_1 * rfac1);
+                                        continue;
+                                }
+                                if (MM_CMP(rx, rlarge, _CMP_GE_OQ) == CHUNK_LANES) {
+                                        __MD rt = MM_SQRT(rpie4 / rx);
+                                        __MD rt2 = rt * rt * rtheta;
+                                        for (i = 0; i < nroots; i++) {
+                                                MM_STORE(u+ig+GRID_BLKSIZE*i, MM_SET1(rt_large[i] / CHUNK_PIE4) * rt2);
+                                                MM_STORE(w+ig+GRID_BLKSIZE*i, MM_SET1(ww_large[i]) * rt * rfac1);
+                                        }
+                                        continue;
+                                }
+                                if (nroots == 2) {
+                                        ALIGNMM double xs[SIMDD];
+                                        ALIGNMM double us[SIMDD*2];
+                                        ALIGNMM double ws[SIMDD*2];
+                                        MM_STORE(xs, rx);
+                                        if (CINTrys_roots_chunk(2, xs, us, ws)) {
+                                                for (i = 0; i < 2; i++) {
+                                                        __MD ru = MM_LOAD(us+SIMDD*i);
+                                                        MM_STORE(u+ig+GRID_BLKSIZE*i, ru / (ru + MM_SET1(1.)) * rtheta);
+                                                        MM_STORE(w+ig+GRID_BLKSIZE*i, MM_LOAD(ws+SIMDD*i) * rfac1);
+                                                }
+                                                continue;
+                                        }
+                                }
+                        }
+#endif
+                        int ig1 = MIN(ig + SIMDD, bgrids);
+                        for (int jg = ig; jg < ig1; jg++) {
+                                x = a0 * RGSQUARE(rijrg, jg);
+                                CINTrys_roots(nroots, x, ubuf, wbuf);
+                                for (i = 0; i < nroots; i++) {
+                                        // u stores t^2 = tau^2 * theta
+                                        u[jg+GRID_BLKSIZE*i] = ubuf[i] / (ubuf[i] + 1) * theta;
+                                        w[jg+GRID_BLKSIZE*i] = wbuf[i] * fac1;
+                                }
                         }
                 }
         }
