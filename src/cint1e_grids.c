@@ -135,13 +135,28 @@ int CINT1e_grids_loop(double *gctr, CINTEnvVars *envs, double *cache)
 
         for (grids_offset = 0; grids_offset < ngrids; grids_offset += GRID_BLKSIZE) {
                 envs->grids_offset = grids_offset;
-                bgrids = MIN(ngrids - grids_offset, GRID_BLKSIZE);
-                bgrids = ALIGN_UP(bgrids, SIMDD);
+                // The SIMD padding of the block, up to bgrids, repeats its last point: nothing past the
+                // caller's grids is read (they often end the env array, and reading past it could fault),
+                // and the padding lanes depend on this block only. ngrids is rounded up to SIMDD; the
+                // caller's count is envs->ngrids.
+                const int nvalid = MIN(envs->ngrids - grids_offset, GRID_BLKSIZE);
+                const double *pgrids = grids + grids_offset * 3;
+                bgrids = ALIGN_UP(nvalid, SIMDD);
 #if (SIMDD == 8) || __AVX2__
                 // x, y, z of four points at a time from three loads, by lane permutations and shuffles
                 // (cheaper than gathers, which are microcoded on some CPUs)
                 for (i = 0; i < bgrids; i += 4) {
-                        const double *pg = grids + (grids_offset+i) * 3;
+                        const double *pg = pgrids + i * 3;
+                        double tail[12];
+                        if (i + 4 > nvalid) {
+                                for (int k = 0; k < 4; k++) {
+                                        const double *p = pgrids + MIN(i + k, nvalid - 1) * 3;
+                                        tail[k*3+0] = p[0];
+                                        tail[k*3+1] = p[1];
+                                        tail[k*3+2] = p[2];
+                                }
+                                pg = tail;
+                        }
                         __m256d a = _mm256_loadu_pd(pg);      // x0 y0 z0 x1
                         __m256d b = _mm256_loadu_pd(pg + 4);  // y1 z1 x2 y2
                         __m256d c = _mm256_loadu_pd(pg + 8);  // z2 x3 y3 z3
@@ -154,9 +169,10 @@ int CINT1e_grids_loop(double *gctr, CINTEnvVars *envs, double *cache)
                 }
 #else
                 for (i = 0; i < bgrids; i++) {
-                        gridsT[i+GRID_BLKSIZE*0] = grids[(grids_offset+i)*3+0];
-                        gridsT[i+GRID_BLKSIZE*1] = grids[(grids_offset+i)*3+1];
-                        gridsT[i+GRID_BLKSIZE*2] = grids[(grids_offset+i)*3+2];
+                        const double *p = pgrids + MIN(i, nvalid - 1) * 3;
+                        gridsT[i+GRID_BLKSIZE*0] = p[0];
+                        gridsT[i+GRID_BLKSIZE*1] = p[1];
+                        gridsT[i+GRID_BLKSIZE*2] = p[2];
                 }
 #endif
 
