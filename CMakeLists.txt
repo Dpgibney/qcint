@@ -90,7 +90,8 @@ set(cintSrc
   src/cint1e_a.c src/cint3c1e_a.c
   src/cint1e_grids.c src/g1e_grids.c
   src/cint2e_batch.c src/cint2e_batch_l0.c src/cint2e_batch_l1.c src/cint2e_batch_l2.c
-  src/cint2e_batch_l3.c
+  src/cint2e_batch_l3.c src/cint2e_batch_ip1_l0.c src/cint2e_batch_ip1_l1.c src/cint2e_batch_ip1_l2.c
+  src/cint2e_batch_ip1_l3.c
   src/autocode/breit1.c src/autocode/dkb.c src/autocode/gaunt1.c
   src/autocode/grad1.c src/autocode/grad2.c src/autocode/hess.c
   src/autocode/int3c1e.c src/autocode/int3c2e.c src/autocode/intor1.c

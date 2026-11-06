@@ -38,13 +38,14 @@ typedef double bvec __attribute__((vector_size(SIMDD * 8), aligned(SIMDD * 8)));
 
 #define BATCH_MAXL      3
 #define BATCH_MAXP      7       // primitives of a shell
-#define BATCH_MAXR      7       // Rys roots of (ff|ff)
-// workspace in bvec: 2D integrals [roots][3][(li+1)(lj+1)(lk+1)(ll+1)], cartesian integrals, and two
-// arrays of the cart -> sph transform
-#define BATCH_NI_MAX    (BATCH_MAXR * 3 * 256)
-#define BATCH_NC_MAX    10000
-#define BATCH_NT1_MAX   7000
-#define BATCH_NT2_MAX   4900
+#define BATCH_MAXR      7       // Rys roots of (ff|ff), and of its first derivative
+// workspace in bvec, for int2e (one component) and int2e_ip1 (three, li+1 on i): 2D integrals
+// [roots][3][(li+1+deriv)(lj+1)(lk+1)(ll+1)], cartesian integrals [comp][...], and two arrays of the
+// cart -> sph transform
+#define BATCH_NI_MAX    (BATCH_MAXR * 3 * 5 * 4 * 4 * 4)
+#define BATCH_NC_MAX    (3 * 10000)
+#define BATCH_NT1_MAX   (3 * 7000)
+#define BATCH_NT2_MAX   (3 * 4900)
 #define BATCH_CACHE_BVEC (BATCH_NI_MAX + BATCH_NC_MAX + BATCH_NT1_MAX + BATCH_NT2_MAX)
 
 typedef struct {
@@ -59,6 +60,11 @@ BATCH_HIDDEN void CINTbatch2e_l0(double *out, int nq, CINTBatch2e *b, double ome
 BATCH_HIDDEN void CINTbatch2e_l1(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
 BATCH_HIDDEN void CINTbatch2e_l2(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
 BATCH_HIDDEN void CINTbatch2e_l3(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
+// int2e_ip1: the gradient of the first shell's functions, 3 components
+BATCH_HIDDEN void CINTbatch2e_ip1_l0(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
+BATCH_HIDDEN void CINTbatch2e_ip1_l1(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
+BATCH_HIDDEN void CINTbatch2e_ip1_l2(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
+BATCH_HIDDEN void CINTbatch2e_ip1_l3(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
 
 // libcint's order of the cartesian functions
 static const int BATCH_CART[BATCH_MAXL + 1][10][3] = {
@@ -113,11 +119,15 @@ void _batch_c2s(bvec *dst, const bvec *src, const int l, int outer, int inner)
 
 static inline __attribute__((always_inline))
 void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache,
-                   const int li, const int lj, const int lk, const int ll)
+                   const int li, const int lj, const int lk, const int ll, const int deriv)
 {
-        const int nroots = (li + lj + lk + ll) / 2 + 1;
-        const int nmax = li + lj, mmax = lk + ll;
-        const int Ni = li + 1, Nj = lj + 1, Nk = lk + 1, Nl = ll + 1;
+        // deriv = 1: int2e_ip1, the gradient of the first shell's functions, as libcint's nabla1i,
+        // d/dx f_i = i f_{i-1} - 2 a_i f_{i+1}: the 2D integrals of i go one higher
+        const int lI = li + deriv;
+        const int ncomp = deriv ? 3 : 1;
+        const int nroots = (lI + lj + lk + ll) / 2 + 1;
+        const int nmax = lI + lj, mmax = lk + ll;
+        const int Ni = lI + 1, Nj = lj + 1, Nk = lk + 1, Nl = ll + 1;
         const int nI = Ni * Nj * Nk * Nl;
         const int nci = (li + 1) * (li + 2) / 2, ncj = (lj + 1) * (lj + 2) / 2;
         const int nck = (lk + 1) * (lk + 2) / 2, ncl = (ll + 1) * (ll + 2) / 2;
@@ -125,8 +135,8 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
         const int ncart = nci * ncj * nck * ncl;
         const int nf = nsi * nsj * nsk * nsl;
         bvec *g2d = cache;                      // [nroots][3][Ni][Nj][Nk][Nl]
-        bvec *gc = g2d + nroots * 3 * nI;         // [ncl][nck][ncj][nci]
-        bvec *t1 = gc + ncart;
+        bvec *gc = g2d + nroots * 3 * nI;       // [comp][ncl][nck][ncj][nci]
+        bvec *t1 = gc + ncomp * ncart;
         bvec *t2 = t1 + BATCH_NT1_MAX;
         const double common = M_PI * M_PI * M_PI * 2 / sqrt(M_PI)
                 * _batch_fac_sp(li) * _batch_fac_sp(lj) * _batch_fac_sp(lk) * _batch_fac_sp(ll);
@@ -142,9 +152,10 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
                 }
         }
 
-        // the base centres of the recurrences, as int2e_sph: a = i if li > lj, else j; c = k if lk > ll, else l
-        const int ibase = li > lj, kbase = lk > ll;
-        const int lb = ibase ? lj : li, ld = kbase ? ll : lk;
+        // the base centres of the recurrences, as int2e_sph and int2e_ip1: a = i if li(+1) > lj, else j;
+        // c = k if lk > ll, else l
+        const int ibase = lI > lj, kbase = lk > ll;
+        const int lb = ibase ? lj : lI, ld = kbase ? ll : lk;
         const int ta = ibase ? 0 : 1, tc = kbase ? 2 : 3;
         bvec rab[3], rcd[3], rrij = {0}, rrkl = {0};
         for (int d = 0; d < 3; d++) {
@@ -155,7 +166,7 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
                 rrij += rij * rij;
                 rrkl += rkl * rkl;
         }
-        for (int n = 0; n < ncart; n++) gc[n] = (bvec){0};
+        for (int n = 0; n < ncomp * ncart; n++) gc[n] = (bvec){0};
 
         for (int pi = 0; pi < b->np[0]; pi++)
         for (int pj = 0; pj < b->np[1]; pj++)
@@ -219,7 +230,7 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
                         for (int d = 0; d < 3; d++) {
                                 const bvec c00 = pa[d] - tmp2 * pq[d];
                                 const bvec c0p = qc[d] + tmp3 * pq[d];
-                                bvec g[2 * BATCH_MAXL + 1][2 * BATCH_MAXL + 1];  // [n][m]: (n 0| m 0)
+                                bvec g[2 * BATCH_MAXL + 2][2 * BATCH_MAXL + 1];  // [n][m]: (n 0| m 0)
                                 g[0][0] = d == 2 ? wr * fac1 : ur - ur + 1;
                                 if (nmax > 0) g[1][0] = c00 * g[0][0];
                                 for (int n = 1; n < nmax; n++)
@@ -232,7 +243,7 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
                                                 g[n][m + 1] = v;
                                         }
                                 // (a, b+1| = (a+1, b| + R_ab (a, b|, a the base centre of the bra
-                                bvec h[BATCH_MAXL + 1][2 * BATCH_MAXL + 1][2 * BATCH_MAXL + 1];  // [b][a][m]
+                                bvec h[BATCH_MAXL + 2][2 * BATCH_MAXL + 2][2 * BATCH_MAXL + 1];  // [b][a][m]
                                 for (int n = 0; n <= nmax; n++)
                                         for (int m = 0; m <= mmax; m++) h[0][n][m] = g[n][m];
                                 for (int nb = 1; nb <= lb; nb++)
@@ -240,7 +251,7 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
                                                 for (int m = 0; m <= mmax; m++)
                                                         h[nb][na][m] = h[nb - 1][na + 1][m] + rab[d] * h[nb - 1][na][m];
                                 bvec *Id = g2d + (r * 3 + d) * nI;
-                                for (int i = 0; i <= li; i++)
+                                for (int i = 0; i <= lI; i++)
                                 for (int j = 0; j <= lj; j++) {
                                         // |c, d+1) = |c+1, d) + R_cd |c, d), c the base centre of the ket
                                         const bvec *row = ibase ? h[j][i] : h[i][j];
@@ -256,6 +267,8 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
                                 }
                         }
                 }
+                const bvec ai2 = -2. * ai;
+                const int si = stride[0];
                 bvec *o = gc;
                 for (int lc = 0; lc < ncl; lc++)
                 for (int kc = 0; kc < nck; kc++)
@@ -264,53 +277,84 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
                         const int x = ox[0][ic] + ox[1][jc] + ox[2][kc] + ox[3][lc];
                         const int y = oy[0][ic] + oy[1][jc] + oy[2][kc] + oy[3][lc] + nI;
                         const int z = oz[0][ic] + oz[1][jc] + oz[2][kc] + oz[3][lc] + 2 * nI;
-                        bvec s = *o;
-                        for (int r = 0; r < nroots; r++) {
-                                const bvec *Ir = g2d + r * 3 * nI;
-                                s += Ir[x] * Ir[y] * Ir[z];
+                        if (deriv == 0) {
+                                bvec s = *o;
+                                for (int r = 0; r < nroots; r++) {
+                                        const bvec *Ir = g2d + r * 3 * nI;
+                                        s += Ir[x] * Ir[y] * Ir[z];
+                                }
+                                *o = s;
+                        } else {
+                                const int ix = BATCH_CART[li][ic][0], iy = BATCH_CART[li][ic][1];
+                                const int iz = BATCH_CART[li][ic][2];
+                                bvec sx = o[0], sy = o[ncart], sz = o[2 * ncart];
+                                for (int r = 0; r < nroots; r++) {
+                                        const bvec *Ir = g2d + r * 3 * nI;
+                                        const bvec gx = Ir[x], gy = Ir[y], gz = Ir[z];
+                                        bvec fx = ai2 * Ir[x + si];
+                                        bvec fy = ai2 * Ir[y + si];
+                                        bvec fz = ai2 * Ir[z + si];
+                                        if (ix) fx = ix * Ir[x - si] + fx;
+                                        if (iy) fy = iy * Ir[y - si] + fy;
+                                        if (iz) fz = iz * Ir[z - si] + fz;
+                                        sx += fx * gy * gz;
+                                        sy += gx * fy * gz;
+                                        sz += gx * gy * fz;
+                                }
+                                o[0] = sx;
+                                o[ncart] = sy;
+                                o[2 * ncart] = sz;
                         }
-                        *o++ = s;
+                        o++;
                 }
         }
 
-        // cart -> sph over l, k, j, i in turn: [lc][kc][jc][ic] -> [ls][ks][js][is]
+        // cart -> sph over l, k, j, i in turn: [comp][lc][kc][jc][ic] -> [comp][ls][ks][js][is]
         const bvec *src = gc;
         bvec *dst;
         if (ll >= 2) {
-                _batch_c2s(t1, src, ll, 1, nck * ncj * nci);
+                _batch_c2s(t1, src, ll, ncomp, nck * ncj * nci);
                 src = t1;
         }
         if (lk >= 2) {
                 dst = src == t1 ? t2 : t1;
-                _batch_c2s(dst, src, lk, nsl, ncj * nci);
+                _batch_c2s(dst, src, lk, ncomp * nsl, ncj * nci);
                 src = dst;
         }
         if (lj >= 2) {
                 dst = src == t1 ? t2 : t1;
-                _batch_c2s(dst, src, lj, nsl * nsk, nci);
+                _batch_c2s(dst, src, lj, ncomp * nsl * nsk, nci);
                 src = dst;
         }
         if (li >= 2) {
                 dst = src == t1 ? t2 : t1;
-                _batch_c2s(dst, src, li, nsl * nsk * nsj, 1);
+                _batch_c2s(dst, src, li, ncomp * nsl * nsk * nsj, 1);
                 src = dst;
         }
         for (int q = 0; q < nq; q++) {
-                double *oq = out + (size_t)q * nf;
-                for (int n = 0; n < nf; n++) oq[n] = src[n][q];
+                double *oq = out + (size_t)q * ncomp * nf;
+                for (int n = 0; n < ncomp * nf; n++) oq[n] = src[n][q];
         }
 }
 
-#define BATCH_CASE(LI, J, K, L) case (J) << 4 | (K) << 2 | (L): \
-        CINTbatch2e_t(out, nq, b, omega, cache, LI, J, K, L); break;
-#define BATCH_L(LI, J, K) BATCH_CASE(LI, J, K, 0) BATCH_CASE(LI, J, K, 1) BATCH_CASE(LI, J, K, 2) \
-        BATCH_CASE(LI, J, K, 3)
-#define BATCH_K(LI, J) BATCH_L(LI, J, 0) BATCH_L(LI, J, 1) BATCH_L(LI, J, 2) BATCH_L(LI, J, 3)
+#define BATCH_CASE(LI, J, K, L, D) case (J) << 4 | (K) << 2 | (L): \
+        CINTbatch2e_t(out, nq, b, omega, cache, LI, J, K, L, D); break;
+#define BATCH_L(LI, J, K, D) BATCH_CASE(LI, J, K, 0, D) BATCH_CASE(LI, J, K, 1, D) BATCH_CASE(LI, J, K, 2, D) \
+        BATCH_CASE(LI, J, K, 3, D)
+#define BATCH_K(LI, J, D) BATCH_L(LI, J, 0, D) BATCH_L(LI, J, 1, D) BATCH_L(LI, J, 2, D) BATCH_L(LI, J, 3, D)
 #define BATCH_DEFINE_LI(LI) \
 BATCH_HIDDEN void CINTbatch2e_l##LI(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, \
-                       int lj, int lk, int ll) \
+                                    int lj, int lk, int ll) \
 { \
         switch (lj << 4 | lk << 2 | ll) { \
-        BATCH_K(LI, 0) BATCH_K(LI, 1) BATCH_K(LI, 2) BATCH_K(LI, 3) \
+        BATCH_K(LI, 0, 0) BATCH_K(LI, 1, 0) BATCH_K(LI, 2, 0) BATCH_K(LI, 3, 0) \
+        } \
+}
+#define BATCH_DEFINE_IP1_LI(LI) \
+BATCH_HIDDEN void CINTbatch2e_ip1_l##LI(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, \
+                                        int lj, int lk, int ll) \
+{ \
+        switch (lj << 4 | lk << 2 | ll) { \
+        BATCH_K(LI, 0, 1) BATCH_K(LI, 1, 1) BATCH_K(LI, 2, 1) BATCH_K(LI, 3, 1) \
         } \
 }

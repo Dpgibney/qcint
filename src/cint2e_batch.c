@@ -33,6 +33,9 @@
  *      used. cache: int2e_sph_batch_cache_size() doubles, or NULL. Every quartet is computed (no
  *      screening): returns 1, or 0 if nq is 0.
  *   int2e_sph_batch_lanes(): the quartets computed together, SIMDD; more than that are taken in turn.
+ *   int2e_ip1_sph_batch, int2e_ip1_sph_batch_ok: the same for int2e_ip1_sph, (nabla i j|k l), whose
+ *      blocks are 3 components (x, y, z) of (2li+1)(2lj+1)(2lk+1)(2ll+1) doubles each, as int2e_ip1_sph.
+ *      The cache size is int2e_sph_batch_cache_size() too.
  */
 
 #include <stdlib.h>
@@ -89,10 +92,14 @@ static void _batch_gather(CINTBatch2e *b, int nq, int *shls, int *atm, int *bas,
         }
 }
 
-EXPORT CACHE_SIZE_T int2e_sph_batch(double *out, int nq, int *shls, int *atm, int natm,
-                                    int *bas, int nbas, double *env, CINTOpt *opt, double *cache)
+EXPORT int int2e_ip1_sph_batch_ok(int *shls, int *bas, double *env)
 {
-        (void)natm; (void)nbas; (void)opt;
+        return int2e_sph_batch_ok(shls, bas, env);
+}
+
+static CACHE_SIZE_T _batch_drive(double *out, int nq, int *shls, int *atm, int *bas, double *env,
+                                 double *cache, int deriv)
+{
         if (nq <= 0) {
                 return 0;
         }
@@ -105,21 +112,44 @@ EXPORT CACHE_SIZE_T int2e_sph_batch(double *out, int nq, int *shls, int *atm, in
         const double omega = env[PTR_RANGE_OMEGA];
         const int li = bas(ANG_OF, shls[0]), lj = bas(ANG_OF, shls[1]);
         const int lk = bas(ANG_OF, shls[2]), ll = bas(ANG_OF, shls[3]);
-        const size_t nf = (size_t)(2 * li + 1) * (2 * lj + 1) * (2 * lk + 1) * (2 * ll + 1);
+        const size_t nf = (size_t)(2 * li + 1) * (2 * lj + 1) * (2 * lk + 1) * (2 * ll + 1) * (deriv ? 3 : 1);
         CINTBatch2e b __attribute__((aligned(SIMDD * 8)));
         for (int q0 = 0; q0 < nq; q0 += SIMDD) {
                 int n = nq - q0 < SIMDD ? nq - q0 : SIMDD;
                 _batch_gather(&b, n, shls + 4 * q0, atm, bas, env);
                 double *o = out + nf * q0;
-                switch (li) {
-                case 0: CINTbatch2e_l0(o, n, &b, omega, work, lj, lk, ll); break;
-                case 1: CINTbatch2e_l1(o, n, &b, omega, work, lj, lk, ll); break;
-                case 2: CINTbatch2e_l2(o, n, &b, omega, work, lj, lk, ll); break;
-                case 3: CINTbatch2e_l3(o, n, &b, omega, work, lj, lk, ll); break;
+                if (deriv) {
+                        switch (li) {
+                        case 0: CINTbatch2e_ip1_l0(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 1: CINTbatch2e_ip1_l1(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 2: CINTbatch2e_ip1_l2(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 3: CINTbatch2e_ip1_l3(o, n, &b, omega, work, lj, lk, ll); break;
+                        }
+                } else {
+                        switch (li) {
+                        case 0: CINTbatch2e_l0(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 1: CINTbatch2e_l1(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 2: CINTbatch2e_l2(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 3: CINTbatch2e_l3(o, n, &b, omega, work, lj, lk, ll); break;
+                        }
                 }
         }
         if (stack != NULL) {
                 free(stack);
         }
         return 1;
+}
+
+EXPORT CACHE_SIZE_T int2e_sph_batch(double *out, int nq, int *shls, int *atm, int natm,
+                                    int *bas, int nbas, double *env, CINTOpt *opt, double *cache)
+{
+        (void)natm; (void)nbas; (void)opt;
+        return _batch_drive(out, nq, shls, atm, bas, env, cache, 0);
+}
+
+EXPORT CACHE_SIZE_T int2e_ip1_sph_batch(double *out, int nq, int *shls, int *atm, int natm,
+                                        int *bas, int nbas, double *env, CINTOpt *opt, double *cache)
+{
+        (void)natm; (void)nbas; (void)opt;
+        return _batch_drive(out, nq, shls, atm, bas, env, cache, 1);
 }
