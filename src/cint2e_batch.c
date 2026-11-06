@@ -36,11 +36,19 @@
  *   int2e_ip1_sph_batch, int2e_ip1_sph_batch_ok: the same for int2e_ip1_sph, (nabla i j|k l), whose
  *      blocks are 3 components (x, y, z) of (2li+1)(2lj+1)(2lk+1)(2ll+1) doubles each, as int2e_ip1_sph.
  *      The cache size is int2e_sph_batch_cache_size() too.
+ *   int2e_ipip1_sph_batch, int2e_ipvip1_sph_batch, int2e_ip1ip2_sph_batch and their _ok: the same for
+ *      the integrals of nuclear Hessians (cint2e_batch_hess.h), blocks of 9 components as
+ *      int2e_ipip1_sph, int2e_ipvip1_sph and int2e_ip1ip2_sph. Their cache size is
+ *      int2e_hess_sph_batch_cache_size().
  */
 
 #include <stdlib.h>
 #include <stdint.h>
-#include "cint2e_batch.h"
+#include "cint2e_batch_hess.h"
+
+// the kinds of _batch_drive
+#define KIND_INT2E      0
+#define KIND_IP1        1
 
 #define EXPORT __attribute__((visibility("default")))
 
@@ -52,6 +60,11 @@ EXPORT int int2e_sph_batch_lanes()
 EXPORT size_t int2e_sph_batch_cache_size()
 {
         return (size_t)BATCH_CACHE_BVEC * SIMDD + SIMDD;
+}
+
+EXPORT size_t int2e_hess_sph_batch_cache_size()
+{
+        return (size_t)HESS_CACHE_BVEC * SIMDD + SIMDD;
 }
 
 EXPORT int int2e_sph_batch_ok(int *shls, int *bas, double *env)
@@ -98,27 +111,50 @@ EXPORT int int2e_ip1_sph_batch_ok(int *shls, int *bas, double *env)
 }
 
 static CACHE_SIZE_T _batch_drive(double *out, int nq, int *shls, int *atm, int *bas, double *env,
-                                 double *cache, int deriv)
+                                 double *cache, int kind)
 {
         if (nq <= 0) {
                 return 0;
         }
         double *stack = NULL;
         if (cache == NULL) {
-                stack = malloc(sizeof(double) * int2e_sph_batch_cache_size());
+                stack = malloc(sizeof(double) * (kind > KIND_IP1 ? int2e_hess_sph_batch_cache_size()
+                                                 : int2e_sph_batch_cache_size()));
                 cache = stack;
         }
         bvec *work = (bvec *)(((uintptr_t)cache + SIMDD * 8 - 1) & ~(uintptr_t)(SIMDD * 8 - 1));
         const double omega = env[PTR_RANGE_OMEGA];
         const int li = bas(ANG_OF, shls[0]), lj = bas(ANG_OF, shls[1]);
         const int lk = bas(ANG_OF, shls[2]), ll = bas(ANG_OF, shls[3]);
-        const size_t nf = (size_t)(2 * li + 1) * (2 * lj + 1) * (2 * lk + 1) * (2 * ll + 1) * (deriv ? 3 : 1);
+        const int ncomp = kind == KIND_INT2E ? 1 : kind == KIND_IP1 ? 3 : 9;
+        const size_t nf = (size_t)(2 * li + 1) * (2 * lj + 1) * (2 * lk + 1) * (2 * ll + 1) * ncomp;
         CINTBatch2e b __attribute__((aligned(SIMDD * 8)));
         for (int q0 = 0; q0 < nq; q0 += SIMDD) {
                 int n = nq - q0 < SIMDD ? nq - q0 : SIMDD;
                 _batch_gather(&b, n, shls + 4 * q0, atm, bas, env);
                 double *o = out + nf * q0;
-                if (deriv) {
+                if (kind == HESS_IPIP1) {
+                        switch (li) {
+                        case 0: CINTbatch2e_ipip1_l0(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 1: CINTbatch2e_ipip1_l1(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 2: CINTbatch2e_ipip1_l2(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 3: CINTbatch2e_ipip1_l3(o, n, &b, omega, work, lj, lk, ll); break;
+                        }
+                } else if (kind == HESS_IPVIP1) {
+                        switch (li) {
+                        case 0: CINTbatch2e_ipvip1_l0(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 1: CINTbatch2e_ipvip1_l1(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 2: CINTbatch2e_ipvip1_l2(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 3: CINTbatch2e_ipvip1_l3(o, n, &b, omega, work, lj, lk, ll); break;
+                        }
+                } else if (kind == HESS_IP1IP2) {
+                        switch (li) {
+                        case 0: CINTbatch2e_ip1ip2_l0(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 1: CINTbatch2e_ip1ip2_l1(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 2: CINTbatch2e_ip1ip2_l2(o, n, &b, omega, work, lj, lk, ll); break;
+                        case 3: CINTbatch2e_ip1ip2_l3(o, n, &b, omega, work, lj, lk, ll); break;
+                        }
+                } else if (kind == KIND_IP1) {
                         switch (li) {
                         case 0: CINTbatch2e_ip1_l0(o, n, &b, omega, work, lj, lk, ll); break;
                         case 1: CINTbatch2e_ip1_l1(o, n, &b, omega, work, lj, lk, ll); break;
@@ -144,12 +180,48 @@ EXPORT CACHE_SIZE_T int2e_sph_batch(double *out, int nq, int *shls, int *atm, in
                                     int *bas, int nbas, double *env, CINTOpt *opt, double *cache)
 {
         (void)natm; (void)nbas; (void)opt;
-        return _batch_drive(out, nq, shls, atm, bas, env, cache, 0);
+        return _batch_drive(out, nq, shls, atm, bas, env, cache, KIND_INT2E);
 }
 
 EXPORT CACHE_SIZE_T int2e_ip1_sph_batch(double *out, int nq, int *shls, int *atm, int natm,
                                         int *bas, int nbas, double *env, CINTOpt *opt, double *cache)
 {
         (void)natm; (void)nbas; (void)opt;
-        return _batch_drive(out, nq, shls, atm, bas, env, cache, 1);
+        return _batch_drive(out, nq, shls, atm, bas, env, cache, KIND_IP1);
+}
+
+EXPORT int int2e_ipip1_sph_batch_ok(int *shls, int *bas, double *env)
+{
+        return int2e_sph_batch_ok(shls, bas, env);
+}
+
+EXPORT int int2e_ipvip1_sph_batch_ok(int *shls, int *bas, double *env)
+{
+        return int2e_sph_batch_ok(shls, bas, env);
+}
+
+EXPORT int int2e_ip1ip2_sph_batch_ok(int *shls, int *bas, double *env)
+{
+        return int2e_sph_batch_ok(shls, bas, env);
+}
+
+EXPORT CACHE_SIZE_T int2e_ipip1_sph_batch(double *out, int nq, int *shls, int *atm, int natm,
+                                          int *bas, int nbas, double *env, CINTOpt *opt, double *cache)
+{
+        (void)natm; (void)nbas; (void)opt;
+        return _batch_drive(out, nq, shls, atm, bas, env, cache, HESS_IPIP1);
+}
+
+EXPORT CACHE_SIZE_T int2e_ipvip1_sph_batch(double *out, int nq, int *shls, int *atm, int natm,
+                                           int *bas, int nbas, double *env, CINTOpt *opt, double *cache)
+{
+        (void)natm; (void)nbas; (void)opt;
+        return _batch_drive(out, nq, shls, atm, bas, env, cache, HESS_IPVIP1);
+}
+
+EXPORT CACHE_SIZE_T int2e_ip1ip2_sph_batch(double *out, int nq, int *shls, int *atm, int natm,
+                                           int *bas, int nbas, double *env, CINTOpt *opt, double *cache)
+{
+        (void)natm; (void)nbas; (void)opt;
+        return _batch_drive(out, nq, shls, atm, bas, env, cache, HESS_IP1IP2);
 }
