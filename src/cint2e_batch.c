@@ -22,8 +22,11 @@
  * int2e_sph of several shell quartets of one class at once (see cint2e_batch.h).
  *
  *   int2e_sph_batch_ok(shls, bas, env): whether quartet shls can go through int2e_sph_batch: every
- *      shell with l <= 3 and one contracted function, fewer than 8 primitive combinations (int2e_sph
- *      fills its lanes with more), and the full or the long-range Coulomb (env[PTR_RANGE_OMEGA] >= 0).
+ *      shell with l <= 3, one contracted function and at most 7 primitives, and the full or the
+ *      long-range Coulomb (env[PTR_RANGE_OMEGA] >= 0). Quartets of 8 or more primitive combinations
+ *      fill int2e_sph's lanes too, but are still a little faster here (one lane per quartet, the
+ *      combinations in turn): caffeine/def2-TZVPD, those with d or f shells 1.1-1.2x with 8 lanes,
+ *      1.3-1.5x with 4; s and p only 0.97-1.0x with 8 lanes, 1.3x with 4.
  *   int2e_sph_batch(out, nq, shls, atm, natm, bas, nbas, env, opt, cache): the nq quartets
  *      shls[4*q..4*q+3], which must share l and the number of primitives of each of their four shells.
  *      out holds nq blocks of (2li+1)(2lj+1)(2lk+1)(2ll+1) doubles in int2e_sph's layout. opt is not
@@ -53,15 +56,14 @@ EXPORT int int2e_sph_batch_ok(int *shls, int *bas, double *env)
         if (env[PTR_RANGE_OMEGA] < 0) {
                 return 0;
         }
-        int ncomb = 1;
         for (int t = 0; t < 4; t++) {
                 int sh = shls[t];
-                if (bas(ANG_OF, sh) > BATCH_MAXL || bas(NCTR_OF, sh) != 1) {
+                if (bas(ANG_OF, sh) > BATCH_MAXL || bas(NCTR_OF, sh) != 1 ||
+                    bas(NPRIM_OF, sh) > BATCH_MAXP) {
                         return 0;
                 }
-                ncomb *= bas(NPRIM_OF, sh);
         }
-        return ncomb < 8;
+        return 1;
 }
 
 static void _batch_gather(CINTBatch2e *b, int nq, int *shls, int *atm, int *bas, double *env)

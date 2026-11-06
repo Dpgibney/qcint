@@ -37,7 +37,7 @@
 typedef double bvec __attribute__((vector_size(SIMDD * 8), aligned(SIMDD * 8)));
 
 #define BATCH_MAXL      3
-#define BATCH_MAXP      7       // primitives of a shell (fewer than 8 combinations per quartet)
+#define BATCH_MAXP      7       // primitives of a shell
 #define BATCH_MAXR      7       // Rys roots of (ff|ff)
 // workspace in bvec: 2D integrals [roots][3][(li+1)(lj+1)(lk+1)(ll+1)], cartesian integrals, and two
 // arrays of the cart -> sph transform
