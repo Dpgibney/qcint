@@ -178,30 +178,30 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
                 bvec fac1;
                 double u[BATCH_MAXR][SIMDD] __attribute__((aligned(SIMDD * 8)));
                 double w[BATCH_MAXR][SIMDD] __attribute__((aligned(SIMDD * 8)));
+                double xs[SIMDD] __attribute__((aligned(SIMDD * 8)));
+                double theta[SIMDD] __attribute__((aligned(SIMDD * 8)));
                 for (int lane = 0; lane < SIMDD; lane++) {
                         const double eij = exp(-ai[lane] * aj[lane] / aij[lane] * rrij[lane]);
                         const double ekl = exp(-ak[lane] * al[lane] / akl[lane] * rrkl[lane]);
                         const double a1l = a1[lane], a0l = a0[lane];
                         double f = sqrt(a0l / (a1l * a1l * a1l)) * common * cc[lane] * eij * ekl;
-                        double x = a0l * rr[lane];
-                        double ul[BATCH_MAXR], wl[BATCH_MAXR];
-                        if (omega == 0) {
-                                CINTrys_roots(nroots, x, ul, wl);
-                        } else {
+                        xs[lane] = a0l * rr[lane];
+                        if (omega != 0) {
                                 // long range, as int2e_sph
-                                double theta = omega * omega / (omega * omega + a0l);
-                                f *= sqrt(theta);
-                                CINTrys_roots(nroots, x * theta, ul, wl);
-                                for (int r = 0; r < nroots; r++) {
-                                        double ut = ul[r] * theta;
-                                        ul[r] = ut / (ul[r] + 1. - ut);
-                                }
+                                theta[lane] = omega * omega / (omega * omega + a0l);
+                                f *= sqrt(theta[lane]);
+                                xs[lane] *= theta[lane];
                         }
                         fac1[lane] = f;
-                        for (int r = 0; r < nroots; r++) {
-                                u[r][lane] = ul[r];
-                                w[r][lane] = wl[r];
-                        }
+                }
+                // the lanes' roots at once where they allow it (all at large x, or 1 or 2 roots), as int2e_sph
+                _CINTrys_roots_batch(nroots, xs, &u[0][0], &w[0][0], SIMDD);
+                if (omega != 0) {
+                        for (int r = 0; r < nroots; r++)
+                                for (int lane = 0; lane < SIMDD; lane++) {
+                                        double ut = u[r][lane] * theta[lane];
+                                        u[r][lane] = ut / (u[r][lane] + 1. - ut);
+                                }
                 }
                 for (int r = 0; r < nroots; r++) {
                         bvec ur, wr;
