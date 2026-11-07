@@ -29,6 +29,13 @@
  * base centres; then g1 = nabla_J g0 (nabla_K for ip1ip2, nabla_I for ipip1), g2 = nabla_I g0 and
  * g3 = nabla_I g1, with nabla f(n) = n f(n-1) - 2 a f(n+1). Component 3a+b holds nabla of
  * direction a on i and of direction b on j (k for ip1ip2, i for ipip1).
+ *
+ * The _dot kernels contract the integrals with ng (at most HESS_MAXG) arrays gam of each quartet, in
+ * int2e_sph's layout: out[(q*ng+n)*9+c] = sum_f int[q][c][f] gam[(q*ng+n)*nf+f]. gam goes to the
+ * cartesian functions by the transpose of the cart -> sph step, once per quartet and array, and is
+ * contracted with the cartesian integrals: no component goes to spherical. (Adding each root sum
+ * to the 9 x ng sums at once instead was slower for s and p shells: the sums do not stay in
+ * registers.)
  */
 #include "cint2e_batch.h"
 
@@ -37,6 +44,7 @@
 #define HESS_IP1IP2     4
 
 #define HESS_MAXR       8       // Rys roots of the second derivatives of (ff|ff)
+#define HESS_MAXG       2       // arrays of a _dot kernel
 // workspace in bvec: the 2D integrals [roots][3][(li+1+dI)(lj+1+dJ)(lk+1+dK)(ll+1)] (at most 400
 // per root and direction), g0..g3 at the output's powers [4][roots][3][(li+1)(lj+1)(lk+1)(ll+1)],
 // the cartesian integrals [9][...], and two arrays of the cart -> sph transform of one component
@@ -59,6 +67,36 @@ BATCH_HIDDEN void CINTbatch2e_ip1ip2_l0(double *out, int nq, CINTBatch2e *b, dou
 BATCH_HIDDEN void CINTbatch2e_ip1ip2_l1(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
 BATCH_HIDDEN void CINTbatch2e_ip1ip2_l2(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
 BATCH_HIDDEN void CINTbatch2e_ip1ip2_l3(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
+#define HESS_DECLARE_DOT(NAME, LI) \
+BATCH_HIDDEN void CINTbatch2e_##NAME##_dot_l##LI(double *out, int nq, CINTBatch2e *b, double omega, \
+                                                 bvec *cache, int lj, int lk, int ll, \
+                                                 const double *gam, int ng);
+HESS_DECLARE_DOT(ipip1, 0) HESS_DECLARE_DOT(ipip1, 1) HESS_DECLARE_DOT(ipip1, 2) HESS_DECLARE_DOT(ipip1, 3)
+HESS_DECLARE_DOT(ipvip1, 0) HESS_DECLARE_DOT(ipvip1, 1) HESS_DECLARE_DOT(ipvip1, 2) HESS_DECLARE_DOT(ipvip1, 3)
+HESS_DECLARE_DOT(ip1ip2, 0) HESS_DECLARE_DOT(ip1ip2, 1) HESS_DECLARE_DOT(ip1ip2, 2) HESS_DECLARE_DOT(ip1ip2, 3)
+
+/*
+ * The transpose of one cart -> sph pass (_batch_c2s): over the index of stride `inner` and extent ns
+ * (-> nc), for every combination of `outer` outer and `inner` inner elements:
+ * dst[o][c][x] = sum_s C2S[l][s][c] src[o][s][x]
+ */
+static inline __attribute__((always_inline))
+void _batch_s2c(bvec *dst, const bvec *src, const int l, int outer, int inner)
+{
+        const int nc = (l + 1) * (l + 2) / 2, ns = 2 * l + 1;
+        for (int o = 0; o < outer; o++)
+        for (int c = 0; c < nc; c++) {
+                bvec *d = dst + (o * nc + c) * inner;
+                const bvec *x = src + o * ns * inner;
+                for (int n = 0; n < inner; n++) d[n] = (bvec){0};
+                for (int s = 0; s < ns; s++) {
+                        const double f = BATCH_C2S[l][s][c];
+                        if (f != 0) {
+                                for (int n = 0; n < inner; n++) d[n] += f * x[s * inner + n];
+                        }
+                }
+        }
+}
 
 // nabla of the 2D integrals e at index p along stride s, power n: n e(n-1) - 2a e(n+1), a2 = -2a,
 // as CINTnabla1i_2e_simd1
@@ -73,7 +111,8 @@ bvec _hess_nabla(const bvec *e, const int p, const int s, const int n, const bve
 
 static inline __attribute__((always_inline))
 void CINTbatch2e_hess_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache,
-                        const int li, const int lj, const int lk, const int ll, const int kind)
+                        const int li, const int lj, const int lk, const int ll, const int kind,
+                        const int dot, const double *gam, const int ng)
 {
         const int dI = kind == HESS_IPIP1 ? 2 : 1;
         const int dJ = kind == HESS_IPVIP1;
@@ -94,7 +133,7 @@ void CINTbatch2e_hess_t(double *out, int nq, CINTBatch2e *b, double omega, bvec 
         bvec *G1 = G0 + nroots * 3 * nO;
         bvec *G2 = G1 + nroots * 3 * nO;
         bvec *G3 = G2 + nroots * 3 * nO;
-        bvec *gc = G3 + nroots * 3 * nO;        // [9][ncl][nck][ncj][nci]
+        bvec *gc = G3 + nroots * 3 * nO;        // [9][ncl][nck][ncj][nci]; the cartesian gam of _dot
         bvec *t1 = gc + 9 * ncart;
         bvec *t2 = t1 + HESS_NT1_MAX;
         const double common = M_PI * M_PI * M_PI * 2 / sqrt(M_PI)
@@ -302,6 +341,72 @@ void CINTbatch2e_hess_t(double *out, int nq, CINTBatch2e *b, double omega, bvec 
                 }
         }
 
+        if (dot) {
+                // gam of the lanes to cartesian, [ng][ncl][nck][ncj][nci], in the space of the 2D
+                // integrals (free now; 2 ncart is at most 0.6 of that space of a class, for
+                // ipip1 (ff|ff); t1 and t2 for the passes); lanes past nq take 0. Then the sums
+                // with the cartesian integrals.
+                bvec *gcart = g2d;
+                for (int n = 0; n < ng; n++) {
+                        for (int f = 0; f < nf; f++) {
+                                bvec v = {0};
+                                for (int q = 0; q < nq; q++) v[q] = gam[((size_t)q * ng + n) * nf + f];
+                                t2[f] = v;
+                        }
+                        const bvec *src = t2;
+                        bvec *dst;
+                        if (li >= 2) {
+                                _batch_s2c(t1, src, li, nsl * nsk * nsj, 1);
+                                src = t1;
+                        }
+                        if (lj >= 2) {
+                                dst = src == t1 ? t2 : t1;
+                                _batch_s2c(dst, src, lj, nsl * nsk, nci);
+                                src = dst;
+                        }
+                        if (lk >= 2) {
+                                dst = src == t1 ? t2 : t1;
+                                _batch_s2c(dst, src, lk, nsl, ncj * nci);
+                                src = dst;
+                        }
+                        bvec *gn = gcart + n * ncart;
+                        if (ll >= 2) {
+                                _batch_s2c(gn, src, ll, 1, nck * ncj * nci);
+                        } else {
+                                for (int f = 0; f < ncart; f++) gn[f] = src[f];
+                        }
+                }
+                // one pass over the cartesian integrals (5.8 MB for (ff|ff) with 8 lanes), the sums in
+                // registers
+                bvec s0[9], s1[9];
+                for (int c = 0; c < 9; c++) {
+                        s0[c] = (bvec){0};
+                        s1[c] = (bvec){0};
+                }
+                if (ng == 2) {
+                        const bvec *g0 = gcart, *g1 = gcart + ncart;
+                        for (int f = 0; f < ncart; f++) {
+                                const bvec a = g0[f], a1 = g1[f];
+                                for (int c = 0; c < 9; c++) {
+                                        const bvec x = gc[c * ncart + f];
+                                        s0[c] += x * a;
+                                        s1[c] += x * a1;
+                                }
+                        }
+                } else {
+                        for (int f = 0; f < ncart; f++) {
+                                const bvec a = gcart[f];
+                                for (int c = 0; c < 9; c++) s0[c] += gc[c * ncart + f] * a;
+                        }
+                }
+                for (int q = 0; q < nq; q++)
+                for (int c = 0; c < 9; c++) {
+                        out[(size_t)q * ng * 9 + c] = s0[c][q];
+                        if (ng == 2) out[((size_t)q * ng + 1) * 9 + c] = s1[c][q];
+                }
+                return;
+        }
+
         // cart -> sph over l, k, j, i in turn, one component at a time:
         // [lc][kc][jc][ic] -> [ls][ks][js][is]
         for (int c = 0; c < 9; c++) {
@@ -334,15 +439,28 @@ void CINTbatch2e_hess_t(double *out, int nq, CINTBatch2e *b, double omega, bvec 
 }
 
 #define HESS_CASE(LI, J, K, L, KIND) case (J) << 4 | (K) << 2 | (L): \
-        CINTbatch2e_hess_t(out, nq, b, omega, cache, LI, J, K, L, KIND); break;
+        CINTbatch2e_hess_t(out, nq, b, omega, cache, LI, J, K, L, KIND, DOT, gam, ng); break;
 #define HESS_L(LI, J, K, KIND) HESS_CASE(LI, J, K, 0, KIND) HESS_CASE(LI, J, K, 1, KIND) \
         HESS_CASE(LI, J, K, 2, KIND) HESS_CASE(LI, J, K, 3, KIND)
 #define HESS_K(LI, J, KIND) HESS_L(LI, J, 0, KIND) HESS_L(LI, J, 1, KIND) HESS_L(LI, J, 2, KIND) \
         HESS_L(LI, J, 3, KIND)
+// the integrals, and the _dot kernels (DOT, gam and ng are the names HESS_CASE takes)
 #define HESS_DEFINE_LI(NAME, LI, KIND) \
 BATCH_HIDDEN void CINTbatch2e_##NAME##_l##LI(double *out, int nq, CINTBatch2e *b, double omega, \
                                              bvec *cache, int lj, int lk, int ll) \
 { \
+        const int DOT = 0; \
+        const double *gam = NULL; \
+        const int ng = 0; \
+        switch (lj << 4 | lk << 2 | ll) { \
+        HESS_K(LI, 0, KIND) HESS_K(LI, 1, KIND) HESS_K(LI, 2, KIND) HESS_K(LI, 3, KIND) \
+        } \
+} \
+BATCH_HIDDEN void CINTbatch2e_##NAME##_dot_l##LI(double *out, int nq, CINTBatch2e *b, double omega, \
+                                                 bvec *cache, int lj, int lk, int ll, \
+                                                 const double *gam, int ng) \
+{ \
+        const int DOT = 1; \
         switch (lj << 4 | lk << 2 | ll) { \
         HESS_K(LI, 0, KIND) HESS_K(LI, 1, KIND) HESS_K(LI, 2, KIND) HESS_K(LI, 3, KIND) \
         } \

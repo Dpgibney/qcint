@@ -40,6 +40,11 @@
  *      the integrals of nuclear Hessians (cint2e_batch_hess.h), blocks of 9 components as
  *      int2e_ipip1_sph, int2e_ipvip1_sph and int2e_ip1ip2_sph. Their cache size is
  *      int2e_hess_sph_batch_cache_size().
+ *   int2e_ipip1_sph_batch_dot, int2e_ipvip1_sph_batch_dot, int2e_ip1ip2_sph_batch_dot(out, nq, shls,
+ *      atm, natm, bas, nbas, env, gam, ng, cache): those integrals contracted with ng (1 or 2) arrays
+ *      of each quartet in int2e_sph's layout, gam[(q*ng+n)*nf+f] with nf the quartet's spherical
+ *      functions: out[(q*ng+n)*9+c] = sum_f int[q][c][f] gam[(q*ng+n)*nf+f]. The cache is that of
+ *      the batched Hessian integrals. Returns 1, or 0 if nq is 0 or ng is not 1 or 2.
  */
 
 #include <stdlib.h>
@@ -176,6 +181,57 @@ static CACHE_SIZE_T _batch_drive(double *out, int nq, int *shls, int *atm, int *
         return 1;
 }
 
+static CACHE_SIZE_T _batch_drive_dot(double *out, int nq, int *shls, int *atm, int *bas, double *env,
+                                     double *cache, int kind, const double *gam, int ng)
+{
+        if (nq <= 0 || ng < 1 || ng > HESS_MAXG) {
+                return 0;
+        }
+        double *stack = NULL;
+        if (cache == NULL) {
+                stack = malloc(sizeof(double) * int2e_hess_sph_batch_cache_size());
+                cache = stack;
+        }
+        bvec *work = (bvec *)(((uintptr_t)cache + SIMDD * 8 - 1) & ~(uintptr_t)(SIMDD * 8 - 1));
+        const double omega = env[PTR_RANGE_OMEGA];
+        const int li = bas(ANG_OF, shls[0]), lj = bas(ANG_OF, shls[1]);
+        const int lk = bas(ANG_OF, shls[2]), ll = bas(ANG_OF, shls[3]);
+        const size_t nf = (size_t)(2 * li + 1) * (2 * lj + 1) * (2 * lk + 1) * (2 * ll + 1);
+        CINTBatch2e b __attribute__((aligned(SIMDD * 8)));
+        for (int q0 = 0; q0 < nq; q0 += SIMDD) {
+                int n = nq - q0 < SIMDD ? nq - q0 : SIMDD;
+                _batch_gather(&b, n, shls + 4 * q0, atm, bas, env);
+                double *o = out + (size_t)9 * ng * q0;
+                const double *g = gam + nf * ng * q0;
+                if (kind == HESS_IPIP1) {
+                        switch (li) {
+                        case 0: CINTbatch2e_ipip1_dot_l0(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        case 1: CINTbatch2e_ipip1_dot_l1(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        case 2: CINTbatch2e_ipip1_dot_l2(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        case 3: CINTbatch2e_ipip1_dot_l3(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        }
+                } else if (kind == HESS_IPVIP1) {
+                        switch (li) {
+                        case 0: CINTbatch2e_ipvip1_dot_l0(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        case 1: CINTbatch2e_ipvip1_dot_l1(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        case 2: CINTbatch2e_ipvip1_dot_l2(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        case 3: CINTbatch2e_ipvip1_dot_l3(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        }
+                } else {
+                        switch (li) {
+                        case 0: CINTbatch2e_ip1ip2_dot_l0(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        case 1: CINTbatch2e_ip1ip2_dot_l1(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        case 2: CINTbatch2e_ip1ip2_dot_l2(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        case 3: CINTbatch2e_ip1ip2_dot_l3(o, n, &b, omega, work, lj, lk, ll, g, ng); break;
+                        }
+                }
+        }
+        if (stack != NULL) {
+                free(stack);
+        }
+        return 1;
+}
+
 EXPORT CACHE_SIZE_T int2e_sph_batch(double *out, int nq, int *shls, int *atm, int natm,
                                     int *bas, int nbas, double *env, CINTOpt *opt, double *cache)
 {
@@ -224,4 +280,28 @@ EXPORT CACHE_SIZE_T int2e_ip1ip2_sph_batch(double *out, int nq, int *shls, int *
 {
         (void)natm; (void)nbas; (void)opt;
         return _batch_drive(out, nq, shls, atm, bas, env, cache, HESS_IP1IP2);
+}
+
+EXPORT CACHE_SIZE_T int2e_ipip1_sph_batch_dot(double *out, int nq, int *shls, int *atm, int natm,
+                                              int *bas, int nbas, double *env, const double *gam,
+                                              int ng, double *cache)
+{
+        (void)natm; (void)nbas;
+        return _batch_drive_dot(out, nq, shls, atm, bas, env, cache, HESS_IPIP1, gam, ng);
+}
+
+EXPORT CACHE_SIZE_T int2e_ipvip1_sph_batch_dot(double *out, int nq, int *shls, int *atm, int natm,
+                                               int *bas, int nbas, double *env, const double *gam,
+                                               int ng, double *cache)
+{
+        (void)natm; (void)nbas;
+        return _batch_drive_dot(out, nq, shls, atm, bas, env, cache, HESS_IPVIP1, gam, ng);
+}
+
+EXPORT CACHE_SIZE_T int2e_ip1ip2_sph_batch_dot(double *out, int nq, int *shls, int *atm, int natm,
+                                               int *bas, int nbas, double *env, const double *gam,
+                                               int ng, double *cache)
+{
+        (void)natm; (void)nbas;
+        return _batch_drive_dot(out, nq, shls, atm, bas, env, cache, HESS_IP1IP2, gam, ng);
 }
