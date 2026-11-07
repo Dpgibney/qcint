@@ -18,7 +18,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-// the batched int2e_ip1_sph kernels with l_i = 2 (one file per l_i, so that they compile in parallel)
-#include "cint2e_batch.h"
+// the batched int2e_ip1_sph kernels with l_i = 2, and their _dot kernels (one file per l_i, so that
+// they compile in parallel)
+#include "cint2e_batch_hess.h"
 
-BATCH_DEFINE_IP1_LI(2)
+HESS_DEFINE_LI(ip1, 2, HESS_IP1)

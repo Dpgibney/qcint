@@ -60,11 +60,7 @@ BATCH_HIDDEN void CINTbatch2e_l0(double *out, int nq, CINTBatch2e *b, double ome
 BATCH_HIDDEN void CINTbatch2e_l1(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
 BATCH_HIDDEN void CINTbatch2e_l2(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
 BATCH_HIDDEN void CINTbatch2e_l3(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
-// int2e_ip1: the gradient of the first shell's functions, 3 components
-BATCH_HIDDEN void CINTbatch2e_ip1_l0(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
-BATCH_HIDDEN void CINTbatch2e_ip1_l1(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
-BATCH_HIDDEN void CINTbatch2e_ip1_l2(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
-BATCH_HIDDEN void CINTbatch2e_ip1_l3(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, int lj, int lk, int ll);
+// (the int2e_ip1 kernels, CINTbatch2e_ip1_l*, come from cint2e_batch_hess.h)
 
 // libcint's order of the cartesian functions
 static const int BATCH_CART[BATCH_MAXL + 1][10][3] = {
@@ -122,7 +118,11 @@ void CINTbatch2e_t(double *out, int nq, CINTBatch2e *b, double omega, bvec *cach
                    const int li, const int lj, const int lk, const int ll, const int deriv)
 {
         // deriv = 1: int2e_ip1, the gradient of the first shell's functions, as libcint's nabla1i,
-        // d/dx f_i = i f_{i-1} - 2 a_i f_{i+1}: the 2D integrals of i go one higher
+        // d/dx f_i = i f_{i-1} - 2 a_i f_{i+1}: the 2D integrals of i go one higher. No longer
+        // instantiated (int2e_ip1_sph_batch comes from cint2e_batch_hess.h with the Hessians'
+        // integrals). The branch stays so that int2e's kernels compile from the same source: without
+        // it GCC contracted other multiply-adds into FMAs, and 501 of benzene/def2-SVP's 969 classes
+        // changed in their last bits.
         const int lI = li + deriv;
         const int ncomp = deriv ? 3 : 1;
         const int nroots = (lI + lj + lk + ll) / 2 + 1;
@@ -348,13 +348,5 @@ BATCH_HIDDEN void CINTbatch2e_l##LI(double *out, int nq, CINTBatch2e *b, double 
 { \
         switch (lj << 4 | lk << 2 | ll) { \
         BATCH_K(LI, 0, 0) BATCH_K(LI, 1, 0) BATCH_K(LI, 2, 0) BATCH_K(LI, 3, 0) \
-        } \
-}
-#define BATCH_DEFINE_IP1_LI(LI) \
-BATCH_HIDDEN void CINTbatch2e_ip1_l##LI(double *out, int nq, CINTBatch2e *b, double omega, bvec *cache, \
-                                        int lj, int lk, int ll) \
-{ \
-        switch (lj << 4 | lk << 2 | ll) { \
-        BATCH_K(LI, 0, 1) BATCH_K(LI, 1, 1) BATCH_K(LI, 2, 1) BATCH_K(LI, 3, 1) \
         } \
 }
