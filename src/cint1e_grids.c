@@ -66,7 +66,13 @@ int CINT1e_grids_loop(double *gctr, CINTEnvVars *envs, double *cache)
                 if (pdata_base == NOVALUE) {
                         return 0;
                 }
-                idx = opt->index_xyz_array[envs->i_l*LMAX1+envs->j_l];
+                if (envs->nrys_roots == envs->rys_order) {
+                        idx = opt->index_xyz_array[envs->i_l*LMAX1+envs->j_l];
+                } else {
+                        // the mixed-range operator has twice the roots the optimizer's indices are for
+                        MALLOC_DATA_INSTACK(idx, nf * 3);
+                        CINTg2c_index_xyz(idx, envs);
+                }
                 non0ctri = opt->non0ctr[i_sh];
                 non0ctrj = opt->non0ctr[j_sh];
                 non0idxi = opt->sortedidx[i_sh];
@@ -375,10 +381,13 @@ CACHE_SIZE_T CINT1e_grids_spinor_drv(double complex *out, int *dims, CINTEnvVars
         return has_value;
 }
 
-// the optimizer of int1e_grids_optimizer, if it has the pair data and the call is for omega = 0
+// the optimizer of int1e_grids_optimizer, if it has the pair data and the call is for omega = 0, or for the
+// mixed-range operator: its pair data are those of omega = 0 (CINTset_pairdata looks at omega < 0 only) and the g
+// indices, which follow the number of roots, are made per call (CINT1e_grids_loop)
 static CINTOpt *_grids_opt(CINTOpt *opt, double *env)
 {
-        if (opt != NULL && opt->pairdata != NULL && env[PTR_RANGE_OMEGA] == 0) {
+        if (opt != NULL && opt->pairdata != NULL &&
+            (env[PTR_RANGE_OMEGA] == 0 || CINTgrids_mixed_range(env))) {
                 return opt;
         }
         return NULL;

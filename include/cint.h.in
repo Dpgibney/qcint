@@ -52,6 +52,13 @@
 #define PTR_GTG_ZETA            10
 #define NGRIDS                  11
 #define PTR_GRIDS               12
+// The mixed-range Coulomb operator of the int1e_grids integrals: with
+// PTR_RANGE_OMEGA > 0, PTR_RINV_ZETA = 0 and either coefficient nonzero,
+//      env[PTR_RANGE_COEFF_FULL] / r12 + env[PTR_RANGE_COEFF_LR] erf(omega*r12) / r12
+// in one evaluation (the exchange of a range-separated hybrid functional).
+// Both zero: the operator PTR_RANGE_OMEGA selects alone.
+#define PTR_RANGE_COEFF_FULL    13
+#define PTR_RANGE_COEFF_LR      14
 #define PTR_ENV_START           20
 
 

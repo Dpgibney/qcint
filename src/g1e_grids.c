@@ -34,6 +34,9 @@ void CINTinit_int1e_grids_EnvVars(CINTEnvVars *envs, int *ng, int *shls,
         double omega = env[PTR_RANGE_OMEGA];
         if (omega < 0 && rys_order <= 3) {
                 nroots *= 2;
+        } else if (CINTgrids_mixed_range(env)) {
+                // the roots of the full-range and of the long-range operator
+                nroots *= 2;
         }
         envs->rys_order = rys_order;
         envs->nrys_roots = nroots;
@@ -63,6 +66,89 @@ void CINTinit_int1e_grids_EnvVars(CINTEnvVars *envs, int *ng, int *shls,
 #define RGSQUARE(r, ig)     (r[ig+GRID_BLKSIZE*0]*r[ig+GRID_BLKSIZE*0] + \
                              r[ig+GRID_BLKSIZE*1]*r[ig+GRID_BLKSIZE*1] + \
                              r[ig+GRID_BLKSIZE*2]*r[ig+GRID_BLKSIZE*2])
+
+/*
+ * Whether env selects the mixed-range operator c_full/r12 + c_lr erf(omega r12)/r12 of the int1e_grids
+ * integrals (PTR_RANGE_COEFF_FULL, PTR_RANGE_COEFF_LR)
+ */
+int CINTgrids_mixed_range(double *env)
+{
+        return (env[PTR_RANGE_OMEGA] > 0 && env[PTR_RINV_ZETA] == 0 &&
+                (env[PTR_RANGE_COEFF_FULL] != 0 || env[PTR_RANGE_COEFF_LR] != 0));
+}
+
+/*
+ * The Rys roots and weights of one Coulomb-type operator on the points of a block, for the mixed-range
+ * operator: u[ig+GRID_BLKSIZE*i] = t^2 * theta and w[ig+GRID_BLKSIZE*i] = weight * fac1 of the nroots roots at
+ * x = a0 |r_ij - r_g|^2. The bare Coulomb operator is a0 = aij, theta = 1; the long-range one a0 = aij*theta
+ * with sqrt(theta) in fac1. The chunks of SIMDD points are those of CINTg0_1e_grids.
+ */
+static void __attribute__((noinline))
+_grids_roots_set(double *RESTRICT u, double *RESTRICT w, double *RESTRICT rijrg, int bgrids,
+                 int nroots, double a0, double fac1, double theta)
+{
+        double ubuf[MXRYSROOTS];
+        double wbuf[MXRYSROOTS];
+        double x;
+        int i, ig;
+#ifdef HAVE_RYS_ROOTS_CHUNK
+        const double *rt_large, *ww_large;
+        CINTrys_largex_tables(nroots, &rt_large, &ww_large);
+        const __MD rlarge = MM_SET1(35. + nroots * 5);
+        const __MD rpie4 = MM_SET1(CHUNK_PIE4);
+        const __MD ra0 = MM_SET1(a0);
+        const __MD rfac1 = MM_SET1(fac1);
+        const __MD rtheta = MM_SET1(theta);
+#endif
+        for (ig = 0; ig < bgrids; ig += SIMDD) {
+#ifdef HAVE_RYS_ROOTS_CHUNK
+                if (ig + SIMDD <= bgrids) {
+                        __MD dx = MM_LOAD(rijrg+ig+GRID_BLKSIZE*0);
+                        __MD dy = MM_LOAD(rijrg+ig+GRID_BLKSIZE*1);
+                        __MD dz = MM_LOAD(rijrg+ig+GRID_BLKSIZE*2);
+                        __MD rx = ra0 * (dx * dx + dy * dy + dz * dz);
+                        __MD rt2_1, rw_1;
+                        if (nroots == 1 && CINTrys_root1_chunk(rx, &rt2_1, &rw_1, 1)) {
+                                MM_STORE(u+ig, rt2_1 * rtheta);
+                                MM_STORE(w+ig, rw_1 * rfac1);
+                                continue;
+                        }
+                        if (MM_CMP(rx, rlarge, _CMP_GE_OQ) == CHUNK_LANES) {
+                                __MD rt = MM_SQRT(rpie4 / rx);
+                                __MD rt2 = rt * rt * rtheta;
+                                for (i = 0; i < nroots; i++) {
+                                        MM_STORE(u+ig+GRID_BLKSIZE*i, MM_SET1(rt_large[i] / CHUNK_PIE4) * rt2);
+                                        MM_STORE(w+ig+GRID_BLKSIZE*i, MM_SET1(ww_large[i]) * rt * rfac1);
+                                }
+                                continue;
+                        }
+                        if (nroots == 2) {
+                                ALIGNMM double xs[SIMDD];
+                                ALIGNMM double us[SIMDD*2];
+                                ALIGNMM double ws[SIMDD*2];
+                                MM_STORE(xs, rx);
+                                if (CINTrys_roots_chunk(2, xs, us, ws)) {
+                                        for (i = 0; i < 2; i++) {
+                                                __MD ru = MM_LOAD(us+SIMDD*i);
+                                                MM_STORE(u+ig+GRID_BLKSIZE*i, ru / (ru + MM_SET1(1.)) * rtheta);
+                                                MM_STORE(w+ig+GRID_BLKSIZE*i, MM_LOAD(ws+SIMDD*i) * rfac1);
+                                        }
+                                        continue;
+                                }
+                        }
+                }
+#endif
+                int ig1 = MIN(ig + SIMDD, bgrids);
+                for (int jg = ig; jg < ig1; jg++) {
+                        x = a0 * RGSQUARE(rijrg, jg);
+                        CINTrys_roots(nroots, x, ubuf, wbuf);
+                        for (i = 0; i < nroots; i++) {
+                                u[jg+GRID_BLKSIZE*i] = ubuf[i] / (ubuf[i] + 1) * theta;
+                                w[jg+GRID_BLKSIZE*i] = wbuf[i] * fac1;
+                        }
+                }
+        }
+}
 
 int CINTg0_1e_grids(double *RESTRICT g, double cutoff, CINTEnvVars *envs,
                     double *cache, double *RESTRICT gridsT)
@@ -221,6 +307,17 @@ int CINTg0_1e_grids(double *RESTRICT g, double cutoff, CINTEnvVars *envs,
                                 }
                         }
                 }
+        } else if (CINTgrids_mixed_range(envs->env)) {
+                // c_full/r12 + c_lr erf(omega r12)/r12: the roots of the bare Coulomb operator with the
+                // weights times c_full, then those of the long-range one with the weights times c_lr
+                int rorder = envs->rys_order;
+                fac1 = envs->fac[0] / aij;
+                omega2 = omega * omega;
+                theta = omega2 / (omega2 + aij);
+                _grids_roots_set(u, w, rijrg, bgrids, rorder, aij,
+                                 fac1 * envs->env[PTR_RANGE_COEFF_FULL], 1.);
+                _grids_roots_set(u + GRID_BLKSIZE*rorder, w + GRID_BLKSIZE*rorder, rijrg, bgrids, rorder,
+                                 aij * theta, fac1 * sqrt(theta) * envs->env[PTR_RANGE_COEFF_LR], theta);
         } else {
                 // * long-range part of range-separated Coulomb
                 // * or Gaussian charge model, with rho(r) = Norm exp(-zeta*r^2)

@@ -12,6 +12,8 @@ void CINTgout1e_grids(double *gout, double *g, int *idx,
 void CINTnabla1i_grids(double *f, double *g,
                        int li, int lj, CINTEnvVars *envs);
 
+int CINTgrids_mixed_range(double *env);
+
 void CINTnabla1j_grids(double *f, double *g,
                        int li, int lj, CINTEnvVars *envs);
 
